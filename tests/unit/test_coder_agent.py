@@ -229,6 +229,40 @@ async def test_coder_agent_scope_violation_detection(workspace: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_coder_agent_ignores_previous_attempt_test_files(workspace: Path) -> None:
+    """Verify Coder does not treat test files from previous Tester attempts as scope violations."""
+    fake_llm = FakeLLMClient()
+    fake_sandbox = FakeSandboxRuntime(SandboxConfig(task_id="t-02b", workspace_path=workspace))
+    # Simulated diff modifying main.py AND an existing test from attempt 1
+    fake_diff = FakeWorkspaceDiff(
+        diff="+main\n+test",
+        changed_files=["main.py", "tests/test_feature.py"],
+    )
+
+    agent = CoderAgent(
+        llm=fake_llm,
+        sandbox=fake_sandbox,
+        workspace_diff=fake_diff,
+        workspace_root=workspace,
+    )
+
+    fake_llm.enqueue(
+        LLMResponse(
+            content='```json\n{"status": "COMPLETED", "summary": "Fix applied", "content": "Done"}\n```',
+            stop_reason=StopReason.END_TURN,
+        )
+    )
+
+    spec = create_sample_spec()  # target_files = ["main.py"]
+    res = await agent.run(CoderInput(task_id="t-02b", spec=spec))
+
+    assert res.status == "COMPLETED"
+    assert res.modified_files == [
+        "main.py"
+    ]  # tests/test_feature.py excluded from Coder modified_files
+
+
+@pytest.mark.asyncio
 async def test_coder_agent_circuit_breaker(workspace: Path) -> None:
     """Verify circuit breaker trips when the exact same tool call fails 3 consecutive times."""
     fake_llm = FakeLLMClient()

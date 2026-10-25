@@ -27,6 +27,7 @@ from oswald.core.tools.coder import (
     check_declared_imports,
     edit_file,
     is_protected_path,
+    is_test_path,
     list_files,
     read_file_range,
     read_symbol,
@@ -472,7 +473,11 @@ class CoderAgent:
             f.strip().removeprefix("./").removeprefix("/") for f in input_data.spec.target_files
         }
         clean_changed = [f.strip().removeprefix("./").removeprefix("/") for f in changed_files]
-        scope_violations = [f for f in clean_changed if f not in whitelist_set]
+
+        # Ignore test files in worktree diff (authored by Tester in previous attempts);
+        # Coder only implements and validates production source files.
+        source_changed = [f for f in clean_changed if not is_test_path(f)]
+        scope_violations = [f for f in source_changed if f not in whitelist_set]
 
         if scope_violations:
             changes = CodeChanges(
@@ -498,16 +503,16 @@ class CoderAgent:
             return changes
 
         # Detect touched protected paths
-        protected_touched = [f for f in clean_changed if is_protected_path(f)]
+        protected_touched = [f for f in source_changed if is_protected_path(f)]
 
         # Run undeclared imports check
-        undeclared_warnings = check_declared_imports(self.workspace_root, clean_changed)
+        undeclared_warnings = check_declared_imports(self.workspace_root, source_changed)
         deviations = list(final_draft.get("deviations", []))
         if undeclared_warnings:
             deviations.extend([f"Import warning: {w}" for w in undeclared_warnings])
 
-        # If completed but git diff is empty
-        if not clean_changed or not diff.strip():
+        # If completed but git diff has no source changes
+        if not source_changed or not diff.strip():
             changes = CodeChanges(
                 task_id=input_data.task_id,
                 status="ESCALATED",
@@ -531,7 +536,7 @@ class CoderAgent:
             task_id=input_data.task_id,
             status="COMPLETED",
             summary=final_draft.get("summary", "Changes implemented successfully"),
-            modified_files=clean_changed,
+            modified_files=source_changed,
             diff=diff,
             content=final_draft.get("content", "# Implementation Notes"),
             deviations=deviations,
@@ -547,7 +552,7 @@ class CoderAgent:
                 attempt=input_data.attempt,
                 payload={
                     "status": "COMPLETED",
-                    "modified_files": clean_changed,
+                    "modified_files": source_changed,
                     "dependency_changes": protected_touched,
                 },
             )

@@ -17,6 +17,7 @@ from oswald.core.agents.coder import (
     NoOpBudgetGuard,
     RunEvent,
 )
+from oswald.core.agents.tester import TesterAgent, TesterInput
 
 __all__ = [
     "BudgetExceededError",
@@ -27,4 +28,6 @@ __all__ = [
     "InMemoryEventSink",
     "NoOpBudgetGuard",
     "RunEvent",
+    "TesterAgent",
+    "TesterInput",
 ]

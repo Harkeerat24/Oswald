@@ -18,6 +18,7 @@ from oswald.core.agents.coder import (
     RunEvent,
 )
 from oswald.core.agents.planner import PlannerAgent, PlannerInput
+from oswald.core.agents.reviewer import ReviewerAgent, ReviewerInput
 from oswald.core.agents.tester import TesterAgent, TesterInput
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "NoOpBudgetGuard",
     "PlannerAgent",
     "PlannerInput",
+    "ReviewerAgent",
+    "ReviewerInput",
     "RunEvent",
     "TesterAgent",
     "TesterInput",

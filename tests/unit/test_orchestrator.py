@@ -396,3 +396,67 @@ async def test_tester_runtime_failure_stops_tool_loop(tmp_path: Path) -> None:
         )
     assert result.execution_error and "daemon failed" in result.execution_error
     assert not result.passed and llm.call_count == 1
+
+
+@pytest.mark.parametrize("outcome", ["questions", "malformed", "provider_error"])
+async def test_real_planner_stops_before_coder(repo: Path, tmp_path: Path, outcome: str) -> None:
+    from oswald.core.agents.planner import PlannerAgent
+    from oswald.core.artifacts.models import PlanSpec
+    from oswald.core.llm.adapters.fake import FakeLLMClient
+    from oswald.core.llm.exceptions import LLMError
+    from oswald.core.orchestrator import PlannerAdapter
+
+    h = Harness(repo, tmp_path / "reports")
+    llm = FakeLLMClient()
+    if outcome == "questions":
+        llm.enqueue_text(
+            json.dumps(
+                {
+                    "summary": "Clarification required",
+                    "content": "Which value?",
+                    "has_open_questions": True,
+                    "open_questions": ["Which value?"],
+                }
+            )
+        )
+    elif outcome == "malformed":
+        for _ in range(3):
+            llm.enqueue_text("Not a specification")
+    else:
+        llm.enqueue(LLMError("provider unavailable"))
+    original = h.pipeline.agents
+
+    def factory(root: Path, runtime: SandboxRuntime, diff: WorkspaceDiff) -> Agents:
+        agents = original(root, runtime, diff)
+        return Agents(
+            PlannerAdapter(PlannerAgent(llm, root, model="fake/planner")),
+            agents.coder,
+            agents.tester,
+            agents.reviewer,
+        )
+
+    h.pipeline.agents = factory
+    result = await h.pipeline.run("Fix value")
+    assert result.stage == "planner" and result.attempts == 0
+    assert result.status == ("FAILED" if outcome == "provider_error" else "STOPPED")
+    assert not h.events  # No Coder/Tester/Reviewer execution.
+    assert h.runtime and h.runtime.status == SandboxStatus.STOPPED
+    assert not Path(result.workspace_root).exists()
+    if outcome != "provider_error":
+        spec = await h.store.load_latest(result.task_id, "spec", PlanSpec)
+        assert spec.has_open_questions and spec.open_questions
+
+
+async def test_planner_adapter_rejects_wrong_snapshot(tmp_path: Path) -> None:
+    from oswald.core.agents.planner import PlannerAgent
+    from oswald.core.llm.adapters.fake import FakeLLMClient
+    from oswald.core.orchestrator import PlannerAdapter
+
+    llm = FakeLLMClient()
+    planner = PlannerAdapter(PlannerAgent(llm, tmp_path, model="fake/planner"))
+    data = PlannerInput(
+        task_id="task", request="Fix", workspace_root=tmp_path / "other", base_commit="abc"
+    )
+    with pytest.raises(ValueError, match="isolated task worktree"):
+        await planner.run(data)
+    assert llm.call_count == 0

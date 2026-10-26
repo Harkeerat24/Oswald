@@ -31,7 +31,7 @@ from oswald.core.vcs.worktree import WorktreeManager
 
 
 class PlannerInput(BaseModel):
-    """Future Planner adapter must inspect workspace_root, never the source checkout."""
+    """Planner adapters inspect workspace_root, never the source checkout."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     task_id: str

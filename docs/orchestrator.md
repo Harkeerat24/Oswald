@@ -5,10 +5,14 @@ worktree, starts a Docker sandbox, and runs Planner → Coder → Tester → Rev
 It saves validated outputs, reports the terminal stage and reason, saves a cumulative
 patch, stops the container, and removes the task worktree and branch.
 
-Planner is still pending on this branch. The integration contract and a temporary
-saved-plan adapter let you verify everything around it now. Scripted model responses
-in tests exercise the real Coder, Tester, and Reviewer implementations; they do not
-prove a live model will successfully implement arbitrary requests.
+The CLI uses the real Planner, Coder, Tester, and Reviewer implementations by
+default. Planner is integrated from upstream prototype PR #21 (`488d630`). A small
+adapter maps the task request to Planner's `prompt` field, passes the pinned base
+commit as context, and checks that Planner is bound to the task worktree.
+
+The automated flow tests script model responses while exercising all four real
+agents, their tools, and the production CLI composition. They verify the integration
+without API keys; they do not prove a live model will implement arbitrary requests.
 
 ## Verify without an API key
 
@@ -33,11 +37,14 @@ docker pull python:3.12-slim
 uv run pytest tests/integration/test_orchestrator_flow.py -m integration -v
 ```
 
-Expect the Docker case to **pass**, rather than skip. It deliberately implements the
-wrong answer on attempt one, runs a failing `unittest` command inside Docker, sends
-findings back to Coder, and passes on attempt two. It also checks that Reviewer sees
-the test-file diff, the final patch passes `git apply --check`, and the task branch,
-worktree, and container are cleaned up. No model API key is used.
+Expect **two Docker cases to pass**, rather than skip: first-attempt success and
+one correction. The correction case deliberately implements the wrong answer,
+runs a failing `unittest` command inside Docker, sends findings back to Coder, and
+passes on attempt two. In both cases, Planner uses its actual list/read tools on
+the committed task snapshot, even though the source checkout has a dirty file.
+Tests also check that Reviewer sees the test-file diff, the final patch passes
+`git apply --check`, and the task branch, worktree, and container are cleaned up.
+No model API key is used.
 
 For the repository checks:
 
@@ -49,11 +56,15 @@ uv run lint-imports
 uv run pytest
 ```
 
-## Run a task through the CLI before Planner lands
+## Run a task through the CLI with real models
 
-The CLI is `uv run python -m oswald.cli`. You must select either `--plan` (temporary
-saved-plan adapter) or `--planner` (a future real Planner factory). There is no silent
-fallback pretending to plan a request.
+The CLI is `uv run python -m oswald.cli`. The real Planner runs by default;
+no saved plan or custom factory is needed.
+
+Create `.env` in this checkout (or export the corresponding environment variables)
+with `LLM_PROVIDER_KEY`, `PLANNER_MODEL`, `CODER_MODEL`, `TESTER_MODEL`, and
+`REVIEWER_MODEL`. Use your provider's key and supported LiteLLM model identifiers.
+A Git worktree does not automatically inherit another checkout's ignored `.env`.
 
 The following Bash example creates a separate demo repository. Keep Oswald as your
 current directory so `uv run` uses Oswald's environment:
@@ -65,46 +76,21 @@ printf 'def value():\n    return 1\n' > "$demo_dir/app.py"
 printf '__pycache__/\n.oswald/\n' > "$demo_dir/.gitignore"
 git -C "$demo_dir" add .
 git -C "$demo_dir" -c user.name=Demo -c user.email=demo@example.com commit -m 'Demo baseline'
-uv run python - "$demo_dir" <<'PY'
-import json
-import subprocess
-import sys
-from pathlib import Path
-
-repo = Path(sys.argv[1])
-base_commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-plan = {
-    "base_commit": base_commit,
-    "spec": {
-        "task_id": "template",
-        "summary": "Make value return 2",
-        "target_files": ["app.py"],
-        "acceptance_criteria": ["value() returns 2"],
-        "content": "Change app.py so value() returns 2. Verify with Python unittest, which is available in the sandbox.",
-    },
-}
-(repo.parent / (repo.name + "-plan.json")).write_text(json.dumps(plan), encoding="utf-8")
-print("Plan:", repo.parent / (repo.name + "-plan.json"))
-PY
-```
-
-Set `LLM_PROVIDER_KEY`, `CODER_MODEL`, `TESTER_MODEL`, and `REVIEWER_MODEL` in your
-environment or Oswald's `.env` to your provider's key and supported LiteLLM model
-identifiers. This command makes real model API calls:
-
-```bash
-uv run python -m oswald.cli 'Make value() return 2 and verify it with unittest' \
+uv run python -m oswald.cli \
+  'Make value() in app.py return 2. Verify it with Python unittest, which is available in the sandbox.' \
   --repo "$demo_dir" \
-  --plan "${demo_dir}-plan.json" \
   --image python:3.12-slim \
   --output .oswald/runs
 ```
 
-The saved plan must match the exact base commit. The adapter assigns the generated
-run ID to the plan. It does not inspect the repository or replace the eventual
-Planner implementation. The normal runtime binds the same isolated worktree at
-`/workspace`; Planner's input, Coder's tools, and Tester's Docker commands all refer
-to that same snapshot. Uncommitted changes in the source checkout are excluded.
+This command makes real model API calls. The automated tests do not require model
+credentials. For your own project, replace `--repo` with its absolute path and
+`--image` with a prebuilt image containing its test dependencies.
+
+The runtime binds the isolated worktree at `/workspace`; Planner's read tools,
+Coder's edit tools, and Tester's Docker commands all use the same repository
+snapshot. Uncommitted changes in the source checkout are excluded. `--base-ref`
+selects the commit/branch to snapshot (defaults to `HEAD`).
 
 Exit code `0` means tests passed and Reviewer approved. Exit code `1` means stopped
 or failed. Ctrl-C records cancellation and exits `130` after cleanup. JSON output
@@ -135,32 +121,32 @@ means the automated Reviewer approved; it does not substitute for human approval
 If patch/log saving or container teardown fails, the result records the failure
 and retains the worktree for recovery. Do not remove it until you recover the changes.
 
-## Connect the future Planner
-
-Provide a synchronous factory `module:factory` accepting the isolated `Path` and
-returning an object with:
-
-```python
-async def run(self, data: PlannerInput) -> PlanSpec: ...
-```
-
-Import `PlannerInput` from `oswald.core.orchestrator`. Its fields are `task_id`,
-`request`, `workspace_root`, and `base_commit`. Build any repository index inside
-this isolated snapshot and inspect it read-only. Return the same task ID. The
-orchestrator validates and saves `PlanSpec`; the Planner adapter need not persist it.
-Configure the Planner's own LLM client/model in your factory. For example:
-
-```bash
-uv run python -m oswald.cli 'Your task request' \
-  --repo /absolute/path/to/repo \
-  --planner your_package.planner_adapter:create_planner \
-  --image your-prebuilt-project-test-image
-```
+## Programmatic use and optional Planner overrides
 
 For programmatic use, inject an `Agents` factory and a `SandboxRuntime` factory into
-`Orchestrator`, then `await orchestrator.run(request, base_ref="HEAD")`. The CLI uses
-`Settings` for the existing three agents and `DockerSandboxRuntime` for execution.
-No API server, database, Redis, Taskiq, or orchestration framework is needed.
+`Orchestrator`, then `await orchestrator.run(request, base_ref="HEAD")`. Wrap a
+`PlannerAgent` with `PlannerAdapter`. Import the orchestration types from
+`oswald.core.orchestrator` and `PlannerAgent` from `oswald.core.agents`. Construct
+`PlannerAgent` with the `root` path supplied
+to your agent factory, as the default CLI does.
+
+`PlannerInput` from `oswald.core.orchestrator` contains `task_id`, `request`,
+`workspace_root`, and `base_commit`. `PlannerAdapter` translates it to the agent's
+`PlannerInput` (`task_id`, `prompt`, and `context`). All four CLI agents use
+`Settings` for model configuration. No API server, database, Redis, Taskiq, or
+orchestration framework is needed.
+
+The CLI retains two optional overrides for diagnostics or custom integrations:
+
+- `--plan /absolute/path/to/plan.json` uses a saved plan instead of calling Planner.
+  The file contains `{"base_commit": "<exact commit SHA>", "spec": {<PlanSpec fields>}}`.
+  A mismatched commit is rejected; the adapter assigns the new task ID to the plan.
+- `--planner module:factory` loads a synchronous factory receiving the isolated
+  workspace `Path`. Return an object with
+  `async run(data: oswald.core.orchestrator.PlannerInput) -> PlanSpec`.
+
+These overrides are mutually exclusive and optional. The orchestrator validates
+and persists the returned specification regardless of which Planner is used.
 
 ## Routing and limits
 

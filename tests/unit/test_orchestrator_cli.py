@@ -12,29 +12,32 @@ from oswald.cli.__main__ import SavedPlanPlanner, main, run
 from oswald.core.agents.coder import CoderAgent
 from oswald.core.agents.reviewer import ReviewerAgent
 from oswald.core.agents.tester import TesterAgent
-from oswald.core.orchestrator import RunResult
+from oswald.core.orchestrator import PlannerAdapter, RunResult
 from oswald.core.sandbox.fake import FakeSandboxRuntime
 from oswald.core.sandbox.models import SandboxConfig
 from oswald.core.vcs.workspace import FakeWorkspaceDiff
 
 
-def test_cli_requires_explicit_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_defaults_to_real_planner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["oswald", "Do something"])
-    with pytest.raises(SystemExit) as error:
-        main()
-    assert error.value.code == 2
+    with patch("oswald.cli.__main__.run", new_callable=AsyncMock, return_value=0) as execute:
+        assert main() == 0
+    args = execute.call_args.args[0]
+    assert args.plan is None and args.planner is None
 
 
 @pytest.mark.parametrize("success", [True, False])
+@pytest.mark.parametrize("saved_plan", [False, True])
 async def test_cli_composes_real_agents_and_returns_exit_code(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     success: bool,
+    saved_plan: bool,
 ) -> None:
     args = argparse.Namespace(
         repo=str(tmp_path),
         output=str(tmp_path / "reports"),
-        plan=str(tmp_path / "plan.json"),
+        plan=str(tmp_path / "plan.json") if saved_plan else None,
         planner=None,
         image="python:3.12-slim",
         stage_timeout=60,
@@ -56,7 +59,13 @@ async def test_cli_composes_real_agents_and_returns_exit_code(
     factory = pipeline.call_args.args[3]
     runtime = FakeSandboxRuntime(SandboxConfig(task_id="test", workspace_path=tmp_path))
     agents = factory(tmp_path, runtime, FakeWorkspaceDiff())
-    assert isinstance(agents.planner, SavedPlanPlanner)
+    if saved_plan:
+        assert isinstance(agents.planner, SavedPlanPlanner)
+    else:
+        assert isinstance(agents.planner, PlannerAdapter)
+        assert agents.planner.agent.workspace_root == tmp_path
+        assert agents.planner.agent.llm is agents.coder.llm
+        assert agents.planner.agent.model
     assert isinstance(agents.coder, CoderAgent)
     assert isinstance(agents.tester, TesterAgent)
     assert isinstance(agents.reviewer, ReviewerAgent)

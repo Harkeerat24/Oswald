@@ -12,21 +12,22 @@ import structlog
 
 from oswald.config import Settings
 from oswald.core.agents.coder import CoderAgent
+from oswald.core.agents.planner import PlannerAgent
 from oswald.core.agents.reviewer import ReviewerAgent
 from oswald.core.agents.tester import TesterAgent
 from oswald.core.artifacts.models import PlanSpec
 from oswald.core.artifacts.storage import FileSystemArtifactStore
 from oswald.core.orchestrator.pipeline import Agent, Agents, Orchestrator, PlannerInput
+from oswald.core.orchestrator.planner import PlannerAdapter
 from oswald.core.sandbox import DockerSandboxRuntime
 from oswald.core.sandbox.protocol import SandboxRuntime
 from oswald.core.vcs.workspace import WorkspaceDiff
 
 
 class SavedPlanPlanner:
-    """Temporary adapter for a manually prepared plan bound to an exact commit.
+    """Optional adapter for a manually prepared plan bound to an exact commit.
 
-    The future Planner replaces this adapter and reads PlannerInput.workspace_root.
-    A saved plan is a verification aid, not repository-aware planning.
+    The default CLI uses PlannerAgent. A saved plan supports replay and diagnostics.
     """
 
     def __init__(self, path: Path) -> None:
@@ -49,13 +50,15 @@ async def run(args: argparse.Namespace) -> int:
     def agents(root: Path, sandbox: SandboxRuntime, diff: WorkspaceDiff) -> Agents:
         if args.plan:
             planner: Agent[PlannerInput, PlanSpec] = SavedPlanPlanner(Path(args.plan).resolve())
-        else:
+        elif args.planner:
             module, separator, name = args.planner.partition(":")
             if not separator or not module or not name:
                 raise ValueError("--planner must be module:factory")
             planner = cast(
                 Agent[PlannerInput, PlanSpec], getattr(importlib.import_module(module), name)(root)
             )
+        else:
+            planner = PlannerAdapter(PlannerAgent(client, root, model=settings.planner_model))
         return Agents(
             planner=planner,
             coder=CoderAgent(client, sandbox, diff, root, model=settings.coder_model),
@@ -94,12 +97,14 @@ def main() -> int:
         help="Prebuilt image containing project/test dependencies",
     )
     parser.add_argument("--stage-timeout", type=float, default=900)
-    planner = parser.add_mutually_exclusive_group(required=True)
+    planner = parser.add_mutually_exclusive_group()
     planner.add_argument(
-        "--plan", help="Saved plan JSON with base_commit and spec (temporary Planner adapter)"
+        "--plan",
+        help="Use a saved plan JSON with base_commit and spec instead of the default Planner",
     )
     planner.add_argument(
-        "--planner", help="Future Planner factory module:function; receives isolated workspace Path"
+        "--planner",
+        help="Override Planner with module:function; factory receives isolated workspace Path",
     )
     args = parser.parse_args()
     structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))

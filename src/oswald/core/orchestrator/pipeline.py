@@ -83,7 +83,7 @@ class Orchestrator:
         sandbox: Callable[[SandboxConfig], SandboxRuntime],
         *,
         image: str = "python:3.12-slim",
-        stage_timeout: float = 180,
+        stage_timeout: float = 1800,
     ) -> None:
         if stage_timeout <= 0:
             raise ValueError("stage_timeout must be positive")

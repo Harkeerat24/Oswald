@@ -162,12 +162,12 @@ and persists the returned specification regardless of which Planner is used.
 | Passing tests plus Reviewer `APPROVED` with no blockers | Succeed |
 
 Reviewer runs after normal test failures to supply additional findings. A rejection
-still ends the run. The per-stage timeout defaults to 180 seconds and is configurable
+still ends the run. The per-stage timeout defaults to 1800 seconds (30 minutes) and is configurable
 with `--stage-timeout`; agent turn ceilings remain in effect. Each model request
-has a 60-second deadline and one transient retry by default, configured with
+has a 300-second deadline (5 minutes) and one transient retry by default, configured with
 `LLM_TIMEOUT_SECONDS` and `LLM_MAX_RETRIES` in `.env`. SDK-internal retries are
 disabled so the adapter owns the retry limit. A stalled request emits a start log
-and either retries or produces a saved stage failure, rather than waiting 600 seconds.
+and either retries or produces a saved stage failure, within the configured deadlines.
 
 Tester uses `run_diagnostic_command` for runtime probes. Diagnostics and unavailable
 optional runners do not count as tests or poison a subsequent valid suite run. Git

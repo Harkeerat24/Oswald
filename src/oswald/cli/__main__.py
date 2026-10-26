@@ -101,7 +101,7 @@ def main() -> int:
         default="python:3.12-slim",
         help="Prebuilt image containing project/test dependencies",
     )
-    parser.add_argument("--stage-timeout", type=float, default=180)
+    parser.add_argument("--stage-timeout", type=float, default=1800)
     planner = parser.add_mutually_exclusive_group()
     planner.add_argument(
         "--plan",

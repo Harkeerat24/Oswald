@@ -118,7 +118,7 @@ class LiteLLMAdapter:
         api_base: str | None = None,
         retry_config: RetryConfig | None = None,
         run_id: str = "",
-        timeout_seconds: float = 60,
+        timeout_seconds: float = 300,
     ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")

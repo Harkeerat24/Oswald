@@ -1,8 +1,5 @@
-"""Core orchestrator package.
+"""Async pipeline coordination and composition contracts."""
 
-Responsibility:
-    The state machine, pipeline coordination, and composition root.
+from oswald.core.orchestrator.pipeline import Agents, Orchestrator, PlannerInput, RunResult
 
-Forbidden imports:
-    Must not import from `oswald.api`, `oswald.workers`, or `oswald.db`.
-"""
+__all__ = ["Agents", "Orchestrator", "PlannerInput", "RunResult"]

@@ -69,6 +69,8 @@ OSWALD transitions deterministically through four specialized roles, passing imm
 
 ## Quickstart
 
+For the local async agent pipeline and verification commands, see [Running the minimal orchestrator](docs/orchestrator.md). Planner integration is pending; a saved-plan adapter is available.
+
 ### Prerequisites
 
 - Python 3.12+

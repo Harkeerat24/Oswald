@@ -429,7 +429,15 @@ class DockerSandboxRuntime:
     async def stop(self) -> None:
         """Terminate and remove the sandbox container."""
         self._log.info("sandbox.stopping", container=self.container_name)
-        await self._run_docker(["rm", "-f", self.container_name], check=False)
+        exit_code, _, stderr = await self._run_docker(
+            ["rm", "-f", self.container_name], check=False
+        )
+        if exit_code != 0 and "no such container" not in stderr.lower():
+            self._status = SandboxStatus.FAILED
+            raise SandboxError(
+                f"Failed to remove sandbox container '{self.container_name}': {stderr.strip()}",
+                task_id=self._config.task_id,
+            )
         self._status = SandboxStatus.STOPPED
 
     async def is_running(self) -> bool:

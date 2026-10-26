@@ -424,7 +424,15 @@ class TesterAgent:
                         )
                     )
                     messages.append(Message(role=Role.TOOL, content=output, tool_call_id=call.id))
+                    if command_result is not None and command_result.execution_error:
+                        final_draft = {
+                            "status": "ESCALATED",
+                            "content": "# Test Runtime Error\n\n" + command_result.execution_error,
+                        }
+                        break
 
+                if final_draft is not None:
+                    break
                 if circuit_broken:
                     logger.warning(
                         "tester.circuit_breaker_tripped", task_id=data.task_id, turn=turn
@@ -554,7 +562,21 @@ class TesterAgent:
             "content", "# Test Report\n\nTester did not produce a completion report."
         )
 
+        execution_error = next(
+            (res.execution_error for res in commands if res.execution_error), None
+        )
+        if not is_completed:
+            execution_error = execution_error or content
+        elif changed:
+            execution_error = "Unauthorized non-test mutations were restored: " + ", ".join(changed)
+        elif not has_commands:
+            execution_error = "No test command was executed."
+        if execution_error:
+            passed = False
+            exit_code = exit_code or 1
+
         result = TestResults(
+            execution_error=execution_error,
             task_id=data.task_id,
             passed=passed,
             exit_code=exit_code,

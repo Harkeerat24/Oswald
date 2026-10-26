@@ -246,6 +246,10 @@ class TestResults(BaseArtifact):
         default=0,
         description="Number of failed tests",
     )
+    execution_error: str | None = Field(
+        default=None,
+        description="Infrastructure or agent failure; not a correctable test failure",
+    )
     test_files: list[str] = Field(
         default_factory=list,
         description="Test files created, updated, or executed",

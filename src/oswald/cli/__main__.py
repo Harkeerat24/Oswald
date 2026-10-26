@@ -1,0 +1,116 @@
+"""Run with python -m oswald.cli; no database, Redis, or worker required."""
+
+import argparse
+import asyncio
+import importlib
+import json
+import sys
+from pathlib import Path
+from typing import cast
+
+import structlog
+
+from oswald.config import Settings
+from oswald.core.agents.coder import CoderAgent
+from oswald.core.agents.reviewer import ReviewerAgent
+from oswald.core.agents.tester import TesterAgent
+from oswald.core.artifacts.models import PlanSpec
+from oswald.core.artifacts.storage import FileSystemArtifactStore
+from oswald.core.orchestrator.pipeline import Agent, Agents, Orchestrator, PlannerInput
+from oswald.core.sandbox import DockerSandboxRuntime
+from oswald.core.sandbox.protocol import SandboxRuntime
+from oswald.core.vcs.workspace import WorkspaceDiff
+
+
+class SavedPlanPlanner:
+    """Temporary adapter for a manually prepared plan bound to an exact commit.
+
+    The future Planner replaces this adapter and reads PlannerInput.workspace_root.
+    A saved plan is a verification aid, not repository-aware planning.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    async def run(self, data: PlannerInput) -> PlanSpec:
+        raw = json.loads(await asyncio.to_thread(self.path.read_text, encoding="utf-8"))
+        if raw["base_commit"] != data.base_commit:
+            raise ValueError("Saved plan base_commit differs from the isolated repository snapshot")
+        spec = PlanSpec.model_validate(raw["spec"])
+        return PlanSpec.model_validate({**spec.model_dump(), "task_id": data.task_id})
+
+
+async def run(args: argparse.Namespace) -> int:
+    from oswald.core.llm.adapters.litellm_adapter import LiteLLMAdapter
+
+    settings = Settings()
+    client = LiteLLMAdapter(api_key=settings.llm_provider_key, api_base=settings.llm_base_url)
+
+    def agents(root: Path, sandbox: SandboxRuntime, diff: WorkspaceDiff) -> Agents:
+        if args.plan:
+            planner: Agent[PlannerInput, PlanSpec] = SavedPlanPlanner(Path(args.plan).resolve())
+        else:
+            module, separator, name = args.planner.partition(":")
+            if not separator or not module or not name:
+                raise ValueError("--planner must be module:factory")
+            planner = cast(
+                Agent[PlannerInput, PlanSpec], getattr(importlib.import_module(module), name)(root)
+            )
+        return Agents(
+            planner=planner,
+            coder=CoderAgent(client, sandbox, diff, root, model=settings.coder_model),
+            tester=TesterAgent(client, sandbox, root, model=settings.tester_model),
+            reviewer=ReviewerAgent(client, model=settings.reviewer_model),
+        )
+
+    output_dir = await asyncio.to_thread(Path(args.output).resolve)
+    orchestrator = Orchestrator(
+        Path(args.repo),
+        output_dir,
+        FileSystemArtifactStore(output_dir),
+        agents,
+        DockerSandboxRuntime,
+        image=args.image,
+        stage_timeout=args.stage_timeout,
+    )
+    result = await orchestrator.run(args.request, base_ref=args.base_ref)
+    print(result.model_dump_json(indent=2))
+    return 0 if result.status == "SUCCEEDED" else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run the bounded Planner → Coder → Tester → Reviewer pipeline"
+    )
+    parser.add_argument("request", help="Task request")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument(
+        "--base-ref", default="HEAD", help="Committed snapshot; uncommitted changes are excluded"
+    )
+    parser.add_argument("--output", default=".oswald/runs")
+    parser.add_argument(
+        "--image",
+        default="python:3.12-slim",
+        help="Prebuilt image containing project/test dependencies",
+    )
+    parser.add_argument("--stage-timeout", type=float, default=900)
+    planner = parser.add_mutually_exclusive_group(required=True)
+    planner.add_argument(
+        "--plan", help="Saved plan JSON with base_commit and spec (temporary Planner adapter)"
+    )
+    planner.add_argument(
+        "--planner", help="Future Planner factory module:function; receives isolated workspace Path"
+    )
+    args = parser.parse_args()
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+    try:
+        return asyncio.run(run(args))
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -144,6 +144,7 @@ class ReviewerAgent:
                 raise ValueError("Reviewer cannot approve escalated code changes")
             if (
                 not test_results.passed
+                or test_results.execution_error
                 or test_results.exit_code != 0
                 or test_results.tests_failed > 0
             ):

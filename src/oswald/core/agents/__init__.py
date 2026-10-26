@@ -17,6 +17,7 @@ from oswald.core.agents.coder import (
     NoOpBudgetGuard,
     RunEvent,
 )
+from oswald.core.agents.reviewer import ReviewerAgent, ReviewerInput
 from oswald.core.agents.tester import TesterAgent, TesterInput
 
 __all__ = [
@@ -27,6 +28,8 @@ __all__ = [
     "EventSink",
     "InMemoryEventSink",
     "NoOpBudgetGuard",
+    "ReviewerAgent",
+    "ReviewerInput",
     "RunEvent",
     "TesterAgent",
     "TesterInput",

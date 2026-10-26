@@ -83,7 +83,7 @@ class Orchestrator:
         sandbox: Callable[[SandboxConfig], SandboxRuntime],
         *,
         image: str = "python:3.12-slim",
-        stage_timeout: float = 900,
+        stage_timeout: float = 180,
     ) -> None:
         if stage_timeout <= 0:
             raise ValueError("stage_timeout must be positive")
@@ -273,6 +273,11 @@ class Orchestrator:
         except asyncio.CancelledError:
             status, reason = "CANCELLED", f"Cancelled during {stage}"
             raise
+        except TimeoutError:
+            status, reason = (
+                "FAILED",
+                f"TimeoutError: {stage} exceeded stage timeout ({self.stage_timeout:g} seconds)",
+            )
         except Exception as exc:
             status, reason = "FAILED", f"{type(exc).__name__}: {exc}"
         finally:

@@ -621,6 +621,18 @@ TESTER_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
     ),
     ToolDefinition(
+        name="run_diagnostic_command",
+        description="Inspect runtime versions or installed tools. Diagnostic results never count as test results. Git inspection uses the supplied diff, not sandbox commands.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 600, "default": 30},
+            },
+            "required": ["command"],
+        },
+    ),
+    ToolDefinition(
         name="run_test_command",
         description="Execute a test runner command as argument vector argv in the isolated sandbox.",
         parameters={

@@ -162,8 +162,21 @@ and persists the returned specification regardless of which Planner is used.
 | Passing tests plus Reviewer `APPROVED` with no blockers | Succeed |
 
 Reviewer runs after normal test failures to supply additional findings. A rejection
-still ends the run. The per-stage timeout defaults to 900 seconds and is configurable
-with `--stage-timeout`; agent turn ceilings remain in effect.
+still ends the run. The per-stage timeout defaults to 180 seconds and is configurable
+with `--stage-timeout`; agent turn ceilings remain in effect. Each model request
+has a 60-second deadline and one transient retry by default, configured with
+`LLM_TIMEOUT_SECONDS` and `LLM_MAX_RETRIES` in `.env`. SDK-internal retries are
+disabled so the adapter owns the retry limit. A stalled request emits a start log
+and either retries or produces a saved stage failure, rather than waiting 600 seconds.
+
+Tester uses `run_diagnostic_command` for runtime probes. Diagnostics and unavailable
+optional runners do not count as tests or poison a subsequent valid suite run. Git
+inspection uses the supplied host diff; task Git metadata is not mounted into the
+container. For the standalone demo, Tester uses standard-library unittest. It parses
+unittest's real test counts and rejects zero-test discovery. Failed discovery
+attempts are diagnostic evidence, so correcting the directory and running a real
+suite can recover without stale failures. Inline Python probes also remain diagnostics. Existing projects still
+need an image containing their actual framework and dependencies.
 
 Docker starts a task container using an already running Docker daemon. It does not
 start the daemon or install your project dependencies. The default image supports
@@ -171,3 +184,14 @@ the standard-library demo above. For a real project, use `--image` with a prebui
 image containing its test tools and dependencies: the sandbox has networking disabled
 and a read-only root filesystem. Native Windows execution has not been verified;
 the documented commands and integration checks target Bash/WSL/Linux.
+
+DeepSeek V4/Flash requests explicitly disable extended thinking. The provider's
+[thinking-mode contract](https://api-docs.deepseek.com/guides/thinking_mode/) requires
+reasoning replay for thinking tool conversations; this minimal pipeline uses ordinary
+content/tool messages and a bounded output budget. Other providers keep their current
+request mode.
+
+Shared plans can contain production and test tasks. Coder's assignment lists only
+production tasks; Tester handles test tasks. Reviewer receives the cumulative diff
+after Tester, so its instructions distinguish Tester additions from Coder's earlier
+source-only notes and whitelist.

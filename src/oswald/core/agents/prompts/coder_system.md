@@ -65,3 +65,14 @@ For escalation:
 ```
 
 Note: The unified diff and list of modified files will be generated mechanically from git by OSWALD. You do not need to provide the diff in the JSON output.
+
+## Sandbox dependencies
+
+The default python:3.12-slim image includes Python and its standard library, but not
+ruff or mypy. Do not repeatedly run unavailable optional static checks or install
+dependencies over the network. Report unavailable checks as limitations.
+
+The Planner's specification is shared across all four agents. Its test-file tasks
+and test acceptance criteria are assigned to Tester, which runs after Coder. Finish
+the production changes and hand off test requirements through test_attention; do
+not escalate solely because the shared specification includes test authoring.

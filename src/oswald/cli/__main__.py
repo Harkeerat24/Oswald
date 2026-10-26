@@ -42,10 +42,15 @@ class SavedPlanPlanner:
 
 
 async def run(args: argparse.Namespace) -> int:
-    from oswald.core.llm.adapters.litellm_adapter import LiteLLMAdapter
+    from oswald.core.llm.adapters.litellm_adapter import LiteLLMAdapter, RetryConfig
 
     settings = Settings()
-    client = LiteLLMAdapter(api_key=settings.llm_provider_key, api_base=settings.llm_base_url)
+    client = LiteLLMAdapter(
+        api_key=settings.llm_provider_key,
+        api_base=settings.llm_base_url,
+        timeout_seconds=settings.llm_timeout_seconds,
+        retry_config=RetryConfig(max_retries=settings.llm_max_retries),
+    )
 
     def agents(root: Path, sandbox: SandboxRuntime, diff: WorkspaceDiff) -> Agents:
         if args.plan:
@@ -96,7 +101,7 @@ def main() -> int:
         default="python:3.12-slim",
         help="Prebuilt image containing project/test dependencies",
     )
-    parser.add_argument("--stage-timeout", type=float, default=900)
+    parser.add_argument("--stage-timeout", type=float, default=180)
     planner = parser.add_mutually_exclusive_group()
     planner.add_argument(
         "--plan",

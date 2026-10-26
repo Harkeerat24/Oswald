@@ -24,6 +24,7 @@ def test_cli_defaults_to_real_planner(monkeypatch: pytest.MonkeyPatch) -> None:
         assert main() == 0
     args = execute.call_args.args[0]
     assert args.plan is None and args.planner is None
+    assert args.stage_timeout == 180
 
 
 @pytest.mark.parametrize("success", [True, False])

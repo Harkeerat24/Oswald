@@ -196,11 +196,51 @@ class TesterAgent:
                     msg = f"{msg}\nDeclared test root: {test_root}"
                 return msg, edit_result.success, None
 
-            elif name == "run_test_command":
+            elif name in {"run_test_command", "run_diagnostic_command"}:
                 raw_command = args.get("command")
                 command = [str(c) for c in raw_command] if isinstance(raw_command, list) else []
+                if command and Path(command[0]).name == "git":
+                    return (
+                        "Git inspection belongs to the host VCS layer. Use the supplied unified diff "
+                        "and modified_files; Git metadata is not available inside the sandbox.",
+                        False,
+                        None,
+                    )
                 timeout = float(args.get("timeout_seconds") or 120.0)
                 command_result = await execute_test_command(self.sandbox, command, timeout)
+
+                python_inline = bool(
+                    command
+                    and Path(command[0]).name.startswith(("python", "pypy"))
+                    and "-c" in command
+                )
+                if (
+                    name == "run_diagnostic_command" or python_inline
+                ) and not command_result.execution_error:
+                    return command_result.output, command_result.exit_code == 0, None
+                if (
+                    command_result.exit_code == 127
+                    or "No module named pytest" in command_result.output
+                ):
+                    return (
+                        command_result.output + "\nRequested tool is unavailable. For a standalone "
+                        "Python unittest suite, use ['python', '-B', '-m', 'unittest', 'discover', '-v']. "
+                        "Do not replace an existing framework's tests with unittest discovery.",
+                        False,
+                        None,
+                    )
+
+                if (
+                    re.search(r"\bRan\s+0\s+tests?\b", command_result.output)
+                    or "ImportError: Start directory is not importable:" in command_result.output
+                ):
+                    return (
+                        command_result.output + "\nNo tests ran: correct unittest discovery. "
+                        "For tests/test_app.py use ['python', '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-v'] "
+                        "without '-t'. For a standalone app.py, prefer a single root test_app.py.",
+                        False,
+                        None,
+                    )
 
                 # Tool invocation succeeded if the command executed in the sandbox without runtime crash/timeout
                 is_tool_success = not (
@@ -264,6 +304,17 @@ class TesterAgent:
 
         for result in commands:
             text = result.output
+
+            # Standard-library unittest: counts are on a separate line from failures.
+            unittest_match = re.search(r"\bRan\s+(\d+)\s+tests?\b", text)
+            if unittest_match:
+                tests_run += int(unittest_match.group(1))
+                summary = re.search(r"FAILED \(([^)]+)\)", text)
+                if summary:
+                    tests_failed += sum(
+                        int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", summary.group(1))
+                    )
+                continue
 
             # 1. Pytest format (e.g. "= 2 passed, 1 failed in 0.12s =" or "= 1 failed in 0.05s =")
             passed_match = re.search(r"\b(\d+)\s+passed\b", text)
@@ -340,6 +391,7 @@ class TesterAgent:
         messages = self._build_initial_messages(data)
 
         commands: list[CommandResult] = []
+        diagnostics: list[str] = []
         latest_commands: dict[str, CommandResult] = {}
         test_roots: set[str] = set()
         final_draft: dict[str, Any] | None = None
@@ -400,6 +452,11 @@ class TesterAgent:
                         if root:
                             test_roots.add(root)
 
+                    if (
+                        call.name in {"run_test_command", "run_diagnostic_command"}
+                        and command_result is None
+                    ):
+                        diagnostics.append(f"[Diagnostic, not a test result]\n{output}")
                     if command_result is not None:
                         commands.append(command_result)
                         cmd_key = " ".join(command_result.command)
@@ -549,7 +606,9 @@ class TesterAgent:
             exit_code = 1
 
         # Format execution output summary
-        output_parts = [f"$ {' '.join(res.command)}\n{res.output}" for res in commands]
+        output_parts = diagnostics + [
+            f"$ {' '.join(res.command)}\n{res.output}" for res in commands
+        ]
         if changed:
             output_parts.append(
                 f"Unauthorized non-test mutations were restored: {', '.join(changed)}"

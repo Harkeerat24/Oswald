@@ -99,7 +99,7 @@ async def test_real_agents_complete_and_correct(
         json.dumps(
             {
                 "summary": "Return 2",
-                "target_files": ["app.py"],
+                "target_files": ["app.py", "test_app.py"],
                 "tasks": [
                     {
                         "step": 1,
@@ -143,6 +143,31 @@ async def test_real_agents_complete_and_correct(
             )
         )
         if attempt == 1:
+            enqueue_tools(
+                llm,
+                ToolCall(
+                    id="git-diagnostic",
+                    name="run_test_command",
+                    arguments={"command": ["git", "status"]},
+                ),
+            )
+            enqueue_tools(
+                llm,
+                ToolCall(
+                    id="runtime",
+                    name="run_diagnostic_command",
+                    arguments={"command": ["python", "--version"]},
+                ),
+            )
+            if docker:
+                enqueue_tools(
+                    llm,
+                    ToolCall(
+                        id="missing-runner",
+                        name="run_test_command",
+                        arguments={"command": ["pytest", "test_app.py"]},
+                    ),
+                )
             enqueue_tools(
                 llm,
                 ToolCall(
@@ -225,13 +250,26 @@ async def test_real_agents_complete_and_correct(
     spec = await store.load_latest(result.task_id, "spec", PlanSpec)
     assert spec.task_id == result.task_id and spec.tasks[0].target_file == "app.py"
     coder_requests = [r for r in llm.requests if r.model == "fake/coder"]
+    assert "Tester authors and runs those" in coder_requests[0].messages[1].content
+    authorized = (
+        coder_requests[0]
+        .messages[1]
+        .content.split("## Authorized Target Files")[1]
+        .split("## Planned Tasks")[0]
+    )
+    assert "test_app.py" not in authorized
     if correction:
         assert "Fix Loop Findings" in coder_requests[2].messages[1].content
     review_request = next(r for r in reversed(llm.requests) if r.model == "fake/reviewer")
     assert "test_app.py" in json.loads(review_request.messages[1].content)["changes"]["diff"]
     assert any(m.role == Role.TOOL for m in llm.requests[1].messages)
     tests = await store.load_latest(result.task_id, "test_results", TestResults)
-    assert tests.passed and "test_value" in tests.output and "OK" in tests.output
+    assert (
+        tests.passed
+        and tests.tests_run == 1
+        and "test_value" in tests.output
+        and "OK" in tests.output
+    )
     final_patch = Path(result.patch_path).read_text()
     assert "+    return 2" in final_patch and "test_app.py" in final_patch
     assert not Path(result.workspace_root).exists()

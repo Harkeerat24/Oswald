@@ -142,17 +142,22 @@ class CoderAgent:
 
     def _build_initial_messages(self, input_data: CoderInput) -> list[Message]:
         system_content = self._load_system_prompt()
+        source_targets = [path for path in input_data.spec.target_files if not is_test_path(path)]
 
         user_parts = [
             f"# Implementation Request: Task {input_data.task_id} (Attempt {input_data.attempt})",
             f"## Summary\n{input_data.spec.summary}",
-            f"## Authorized Target Files (Strict Whitelist)\n{json.dumps(input_data.spec.target_files, indent=2)}",
+            "## Stage Assignment\nImplement production changes only. The shared plan may include test tasks; "
+            "Tester authors and runs those after your stage. Do not attempt test-file edits or escalate "
+            "solely because test authoring remains. Record test requirements in test_attention.",
+            f"## Authorized Target Files (Strict Whitelist)\n{json.dumps(source_targets, indent=2)}",
         ]
 
         if input_data.spec.tasks:
             tasks_md = "\n".join(
                 f"{t.step}. [{t.action.upper()}] `{t.target_file}`: {t.description} ({t.details})"
                 for t in input_data.spec.tasks
+                if not is_test_path(t.target_file)
             )
             user_parts.append(f"## Planned Tasks\n{tasks_md}")
 

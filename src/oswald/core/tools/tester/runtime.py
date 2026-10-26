@@ -347,6 +347,7 @@ class CommandResult:
     exit_code: int
     output: str
     duration_seconds: float
+    execution_error: str | None = None
 
 
 async def execute_test_command(
@@ -366,10 +367,14 @@ async def execute_test_command(
         result = await sandbox.exec_command(clean, timeout_seconds=timeout_seconds)
     except SandboxTimeoutError as exc:
         logger.error("test_tool.command_timeout", command=clean, timeout=timeout_seconds)
-        return CommandResult(clean, 124, f"Command timed out: {exc}", timeout_seconds)
+        return CommandResult(
+            clean, 124, f"Command timed out: {exc}", timeout_seconds, f"Command timed out: {exc}"
+        )
     except SandboxError as exc:
         logger.error("test_tool.sandbox_error", command=clean, error=str(exc))
-        return CommandResult(clean, 1, f"Sandbox execution error: {exc}", 0.0)
+        return CommandResult(
+            clean, 1, f"Sandbox execution error: {exc}", 0.0, f"Sandbox execution error: {exc}"
+        )
 
     combined_output = f"{result.stdout}\n{result.stderr}".strip()
     output = truncate_output(combined_output or "Command completed with no output.")
@@ -613,6 +618,18 @@ TESTER_TOOL_DEFINITIONS: list[ToolDefinition] = [
                 },
             },
             "required": ["file_path", "old_str", "new_str"],
+        },
+    ),
+    ToolDefinition(
+        name="run_diagnostic_command",
+        description="Inspect runtime versions or installed tools. Diagnostic results never count as test results. Git inspection uses the supplied diff, not sandbox commands.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}},
+                "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 600, "default": 30},
+            },
+            "required": ["command"],
         },
     ),
     ToolDefinition(

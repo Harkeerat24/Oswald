@@ -19,6 +19,20 @@ class Settings(BaseSettings):
         description="Optional custom API base URL for local models or proxy",
     )
 
+    llm_timeout_seconds: float = Field(
+        default=300,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="LLM_TIMEOUT_SECONDS",
+        description="Deadline for each model API request, in seconds",
+    )
+    llm_max_retries: int = Field(
+        default=1,
+        ge=0,
+        validation_alias="LLM_MAX_RETRIES",
+        description="Maximum retries for transient provider failures per completion",
+    )
+
     # Agent model configurations (LiteLLM format, e.g., gemini/gemini-2.0-flash, gpt-4o, claude-3-5-sonnet-20241022)
     default_model: str = Field(
         default="gemini/gemini-2.0-flash",

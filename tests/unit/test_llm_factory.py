@@ -20,6 +20,8 @@ def test_create_llm_client_with_custom_settings() -> None:
     assert client._api_key == "custom-secret-key"
     assert client._api_base == "http://localhost:11434/v1"
     assert client._run_id == "run-factory-42"
+    assert client._timeout_seconds == settings.llm_timeout_seconds
+    assert client._retry_config.max_retries == settings.llm_max_retries
 
 
 def test_create_llm_client_with_default_settings() -> None:

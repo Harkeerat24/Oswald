@@ -354,3 +354,66 @@ async def test_litellm_adapter_maps_api_error(
         assert exc_info.value.status_code == status_code
     else:
         assert exc_info.value.status_code is None
+
+
+async def test_request_timeout_is_bounded_and_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    calls = 0
+
+    async def complete(**kwargs: Any) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        assert kwargs["timeout"] == 0.01 and kwargs["num_retries"] == 0
+        if calls == 1:
+            await asyncio.Event().wait()
+        return _make_dummy_response()
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    adapter = LiteLLMAdapter(
+        api_key="test",
+        timeout_seconds=0.01,
+        retry_config=RetryConfig(max_retries=1, base_delay_seconds=0, jitter_factor=0),
+    )
+    result = await adapter.complete(
+        LLMRequest(model="fake/test", messages=[Message(role=Role.USER, content="Hi")])
+    )
+    assert result.content == "Test response" and calls == 2
+
+
+async def test_request_timeout_exhausts_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    async def hang(**kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    complete = AsyncMock(side_effect=hang)
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    adapter = LiteLLMAdapter(
+        api_key="test",
+        timeout_seconds=0.01,
+        retry_config=RetryConfig(max_retries=1, base_delay_seconds=0, jitter_factor=0),
+    )
+    with pytest.raises(LLMProviderError, match=r"timed out after 0\.01 seconds"):
+        await adapter.complete(
+            LLMRequest(model="fake/test", messages=[Message(role=Role.USER, content="Hi")])
+        )
+    assert complete.await_count == 2
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_invalid_request_timeout_is_rejected(timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        LiteLLMAdapter(api_key="test", timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("model", ["deepseek/deepseek-v4-flash", "deepseek/deepseek-flash"])
+async def test_deepseek_flash_uses_content_mode(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    complete = AsyncMock(return_value=_make_dummy_response())
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    await LiteLLMAdapter(api_key="test").complete(
+        LLMRequest(model=model, messages=[Message(role=Role.USER, content="Hi")]),
+    )
+    assert complete.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}

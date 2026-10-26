@@ -1,6 +1,7 @@
 """Unit tests for TesterAgent and its dedicated test tools."""
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -718,3 +719,117 @@ async def test_tester_allows_editing_test_files_present_in_spec_and_changes(
     result = await agent.run(inp)
     assert result.passed is True
     assert "def test_updated(): pass" in test_file.read_text(encoding="utf-8")
+
+
+async def test_diagnostics_and_missing_runner_do_not_poison_unittest(workspace: Path) -> None:
+    import json
+
+    llm = FakeLLMClient()
+    sandbox = FakeSandboxRuntime(SandboxConfig(task_id="tester-1", workspace_path=workspace))
+    sandbox.queue_response(stdout="Python 3.12")
+    sandbox.queue_response(exit_code=127, stdout="exec: pytest: executable file not found in $PATH")
+    sandbox.queue_response(stdout="Ran 1 test in 0.001s\n\nOK")
+    await sandbox.start()
+    calls: list[tuple[str, dict[str, Any]]] = [
+        ("run_test_command", {"command": ["git", "status", "--porcelain"]}),
+        ("run_diagnostic_command", {"command": ["python", "--version"]}),
+        ("run_test_command", {"command": ["pytest", "test_app.py"]}),
+        (
+            "write_test_file",
+            {"file_path": "test_app.py", "old_str": "", "new_str": "import unittest\n"},
+        ),
+        ("run_test_command", {"command": ["python", "-m", "unittest", "discover", "-v"]}),
+    ]
+    for i, (name, arguments) in enumerate(calls):
+        llm.enqueue(
+            LLMResponse(
+                stop_reason=StopReason.TOOL_USE,
+                tool_calls=[ToolCall(id=str(i), name=name, arguments=arguments)],
+            )
+        )
+    llm.enqueue_text(json.dumps({"status": "COMPLETED", "content": "One behavior verified"}))
+    result = await TesterAgent(llm, sandbox, workspace).run(_input())
+    assert result.passed and result.tests_run == 1 and result.tests_failed == 0
+    assert not result.execution_error
+    assert "Git inspection belongs" in result.output and "unavailable" in result.output
+    assert not any(command[0] == "git" for command in sandbox.executed_commands)
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+async def test_zero_tests_and_diagnostics_cannot_pass(workspace: Path, diagnostic: bool) -> None:
+    llm = FakeLLMClient()
+    sandbox = FakeSandboxRuntime(SandboxConfig(task_id="tester-1", workspace_path=workspace))
+    sandbox.queue_response(stdout="Python 3.12" if diagnostic else "Ran 0 tests in 0.001s\n\nOK")
+    await sandbox.start()
+    llm.enqueue(
+        LLMResponse(
+            stop_reason=StopReason.TOOL_USE,
+            tool_calls=[
+                ToolCall(
+                    id="run",
+                    name="run_diagnostic_command" if diagnostic else "run_test_command",
+                    arguments={
+                        "command": ["python", "--version"]
+                        if diagnostic
+                        else ["python", "-m", "unittest"]
+                    },
+                )
+            ],
+        )
+    )
+    llm.enqueue_text('{"status": "COMPLETED", "content": "Claimed success"}')
+    result = await TesterAgent(llm, sandbox, workspace).run(_input())
+    assert not result.passed and result.execution_error
+    assert result.tests_run == 0
+
+
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("Ran 3 tests in 0.01s\nOK (skipped=1)", (3, 0)),
+        ("Ran 3 tests in 0.01s\nFAILED (failures=1, errors=1)", (3, 2)),
+    ],
+)
+def test_unittest_metrics(output: str, expected: tuple[int, int]) -> None:
+    from oswald.core.tools.tester.runtime import CommandResult
+
+    assert (
+        TesterAgent._extract_metrics([CommandResult(["python", "-m", "unittest"], 0, output, 0.01)])
+        == expected
+    )
+
+
+async def test_unittest_discovery_recovery_and_inline_diagnostics(workspace: Path) -> None:
+    llm = FakeLLMClient()
+    sandbox = FakeSandboxRuntime(SandboxConfig(task_id="tester-1", workspace_path=workspace))
+    await sandbox.start()
+    for code, text in (
+        (5, "Ran 0 tests in 0.001s\nNO TESTS RAN"),
+        (1, "ImportError: Start directory is not importable: '/workspace/tests'"),
+        (
+            0,
+            "Ran 1 test in 0.001s\nFAILED (errors=1)",
+        ),  # A synthetic inline diagnostic, not the suite.
+        (0, "Ran 1 test in 0.001s\nOK"),
+    ):
+        sandbox.queue_response(exit_code=code, stdout=text)
+    commands = [
+        ["python", "-m", "unittest", "discover"],
+        ["python", "-m", "unittest", "discover", "-s", "tests", "-t", "."],
+        ["python", "-c", "print('synthetic test output')"],
+        ["python", "-m", "unittest", "discover", "-s", "tests"],
+    ]
+    for i, command in enumerate(commands):
+        llm.enqueue(
+            LLMResponse(
+                stop_reason=StopReason.TOOL_USE,
+                tool_calls=[
+                    ToolCall(id=str(i), name="run_test_command", arguments={"command": command}),
+                ],
+            )
+        )
+    llm.enqueue_text('{"status": "COMPLETED", "content": "Discovery corrected, one test passed"}')
+    result = await TesterAgent(llm, sandbox, workspace).run(_input())
+    assert result.passed and result.tests_run == 1 and result.tests_failed == 0
+    assert not result.execution_error
+    assert "No tests ran" in result.output

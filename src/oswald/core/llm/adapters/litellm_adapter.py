@@ -7,6 +7,7 @@ Vendor coupling boundary: this is the ONLY file that imports litellm.
 
 import asyncio
 import json
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -16,6 +17,7 @@ from typing import Any
 import litellm
 import structlog
 from litellm.exceptions import APIError, RateLimitError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from oswald.core.llm.exceptions import (
     LLMProviderError,
@@ -116,7 +118,11 @@ class LiteLLMAdapter:
         api_base: str | None = None,
         retry_config: RetryConfig | None = None,
         run_id: str = "",
+        timeout_seconds: float = 300,
     ) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        self._timeout_seconds = timeout_seconds
         self._api_key = api_key
         self._api_base = api_base
         self._retry_config = retry_config or RetryConfig()
@@ -131,7 +137,14 @@ class LiteLLMAdapter:
         async def _call() -> LLMResponse:
             start = time.monotonic()
             try:
-                raw = await litellm.acompletion(**kwargs)
+                logger.info(
+                    "llm.completion.started",
+                    run_id=self._run_id,
+                    model=request.model,
+                    timeout_seconds=self._timeout_seconds,
+                )
+                async with asyncio.timeout(self._timeout_seconds):
+                    raw = await litellm.acompletion(**kwargs)
                 elapsed = time.monotonic() - start
                 response = self._translate_response(raw, request.model, elapsed)
 
@@ -145,6 +158,12 @@ class LiteLLMAdapter:
                     stop_reason=response.stop_reason,
                 )
                 return response
+            except (TimeoutError, LiteLLMTimeout) as exc:
+                raise LLMProviderError(
+                    f"Model request timed out after {self._timeout_seconds:g} seconds",
+                    model=request.model,
+                    is_retryable=True,
+                ) from exc
             except RateLimitError as exc:
                 retry_after: float | None = None
                 headers = getattr(exc, "headers", None)
@@ -185,7 +204,14 @@ class LiteLLMAdapter:
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "api_key": self._api_key,
+            "timeout": self._timeout_seconds,
+            "num_retries": 0,
         }
+
+        # V4 defaults to thinking, which requires replaying reasoning_content across tools.
+        # This bounded pipeline uses ordinary content/tool messages, so request non-thinking mode.
+        if request.model.startswith(("deepseek/deepseek-v4-", "deepseek/deepseek-flash")):
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         if self._api_base:
             kwargs["api_base"] = self._api_base

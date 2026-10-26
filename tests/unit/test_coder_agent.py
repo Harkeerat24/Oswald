@@ -470,3 +470,31 @@ async def test_coder_agent_concurrency_isolation(tmp_path: Path) -> None:
     assert res2.task_id == "task-c2"
     assert res2.summary == "Done 2"
     assert res2.diff == "+ws2_mod"
+
+
+def test_shared_plan_assigns_test_tasks_to_tester(workspace: Path) -> None:
+    from oswald.core.artifacts.models import TaskItem
+
+    spec = PlanSpec(
+        task_id="task-001",
+        summary="Implement and test",
+        target_files=["main.py", "test_main.py"],
+        tasks=[
+            TaskItem(step=1, description="Change source", target_file="main.py", action="modify"),
+            TaskItem(
+                step=2, description="Author test", target_file="test_main.py", action="create"
+            ),
+        ],
+        content="Implement source and add a test.",
+    )
+    agent = CoderAgent(
+        FakeLLMClient(),
+        FakeSandboxRuntime(SandboxConfig(task_id="task-001", workspace_path=workspace)),
+        FakeWorkspaceDiff(),
+        workspace,
+    )
+    prompt = agent._build_initial_messages(CoderInput(task_id="task-001", spec=spec))[1].content
+    assert "Tester authors and runs those" in prompt
+    assert '"test_main.py"' not in prompt
+    assert "2. [CREATE]" not in prompt
+    assert "1. [MODIFY]" in prompt

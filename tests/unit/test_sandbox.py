@@ -467,3 +467,20 @@ async def test_docker_sandbox_exec_sandbox_error_kills_container(
 
     assert runtime.status == SandboxStatus.FAILED
     assert any("kill" in c and runtime.container_name in c for c in calls)
+
+
+async def test_docker_stop_reports_removal_failure(sample_config: SandboxConfig) -> None:
+    runtime = DockerSandboxRuntime(sample_config)
+    runtime._run_docker = AsyncMock(return_value=(1, "", "daemon unavailable"))  # type: ignore[method-assign]
+    with pytest.raises(SandboxError, match="daemon unavailable"):
+        await runtime.stop()
+    assert _status(runtime) == SandboxStatus.FAILED
+
+
+async def test_docker_stop_is_idempotent_when_container_absent(
+    sample_config: SandboxConfig,
+) -> None:
+    runtime = DockerSandboxRuntime(sample_config)
+    runtime._run_docker = AsyncMock(return_value=(1, "", "Error: No such container: task"))  # type: ignore[method-assign]
+    await runtime.stop()
+    assert _status(runtime) == SandboxStatus.STOPPED

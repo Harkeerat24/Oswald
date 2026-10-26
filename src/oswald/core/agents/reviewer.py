@@ -1,0 +1,178 @@
+"""Read-only review of pipeline artifacts through the LLMClient protocol."""
+
+import json
+from pathlib import Path
+
+import structlog
+from pydantic import BaseModel, ConfigDict, Field
+
+from oswald.core.agents.coder import (
+    BudgetGuard,
+    EventSink,
+    InMemoryEventSink,
+    NoOpBudgetGuard,
+    RunEvent,
+)
+from oswald.core.artifacts.models import (
+    CodeChanges,
+    PlanSpec,
+    ReviewVerdict,
+    ReviewVerdictStatus,
+    TestResults,
+)
+from oswald.core.llm.protocol import LLMClient
+from oswald.core.llm.types import LLMRequest, Message, Role, StopReason
+
+logger = structlog.get_logger().bind(component="agent.reviewer")
+_DEFAULT_PROMPT_PATH = Path(__file__).parent / "prompts" / "reviewer_system.md"
+
+
+class ReviewerInput(BaseModel):
+    """Immutable upstream artifacts delivered to the Reviewer for one attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    attempt: int = Field(default=1, ge=1)
+    spec: PlanSpec
+    changes: CodeChanges
+    test_results: TestResults
+
+
+class _ReviewResponse(BaseModel):
+    """Model-authored fields; task identity and timestamps belong to the caller."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    verdict: ReviewVerdictStatus
+    summary: str = Field(min_length=1)
+    blocking_issues: list[str]
+    content: str = Field(min_length=1)
+
+
+class ReviewerAgent:
+    """Evaluate a specification, diff, and test report without executing tools.
+
+    Inject an LLMClient and the model identifier from Settings.reviewer_model.
+    The caller owns artifact persistence and the separate human approval gate.
+    """
+
+    def __init__(
+        self,
+        llm: LLMClient,
+        *,
+        model: str,
+        budget_guard: BudgetGuard | None = None,
+        event_sink: EventSink | None = None,
+        prompt_path: Path | None = None,
+    ) -> None:
+        if not model.strip():
+            raise ValueError("Reviewer model must not be blank")
+        self.llm = llm
+        self.model = model
+        self.budget_guard = budget_guard or NoOpBudgetGuard()
+        self.event_sink = event_sink or InMemoryEventSink()
+        self.prompt_path = prompt_path or _DEFAULT_PROMPT_PATH
+
+    async def run(self, data: ReviewerInput) -> ReviewVerdict:
+        """Return a validated review for artifacts belonging to the same task.
+
+        Raises:
+            BudgetExceededError: The shared budget guard rejects the review attempt.
+            ValueError: Task identifiers differ, the completion is incomplete,
+                or the verdict contradicts blocking evidence.
+            ValidationError: The completion does not match the response schema.
+            LLMError: The injected client cannot complete the request.
+        """
+        spec, changes, test_results = data.spec, data.changes, data.test_results
+        if any(artifact.task_id != data.task_id for artifact in (spec, changes, test_results)):
+            raise ValueError("Reviewer input artifacts must belong to the same task")
+
+        self.budget_guard.check(data.task_id)
+        logger.info("reviewer.run_started", task_id=data.task_id, attempt=data.attempt)
+        await self.event_sink.emit(
+            RunEvent(
+                task_id=data.task_id,
+                agent="reviewer",
+                event_type="reviewer.started",
+                attempt=data.attempt,
+            )
+        )
+        request = LLMRequest(
+            model=self.model,
+            messages=[
+                Message(role=Role.SYSTEM, content=self.prompt_path.read_text(encoding="utf-8")),
+                Message(
+                    role=Role.USER,
+                    content=json.dumps(
+                        {
+                            "spec": spec.model_dump(mode="json"),
+                            "changes": changes.model_dump(mode="json"),
+                            "test_results": test_results.model_dump(mode="json"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ],
+        )
+        response = await self.llm.complete(request)
+        await self.event_sink.emit(
+            RunEvent(
+                task_id=data.task_id,
+                agent="reviewer",
+                event_type="reviewer.llm_completion",
+                attempt=data.attempt,
+                payload={
+                    "stop_reason": str(response.stop_reason),
+                    "tool_calls": len(response.tool_calls),
+                    "tokens": response.usage.model_dump(),
+                },
+            )
+        )
+        if response.stop_reason != StopReason.END_TURN or response.tool_calls:
+            raise ValueError("Reviewer requires a complete response without tool calls")
+
+        review = _ReviewResponse.model_validate_json(response.content)
+        if not review.summary.strip() or not review.content.strip():
+            raise ValueError("Reviewer summary and content must not be blank")
+        if any(not issue.strip() for issue in review.blocking_issues):
+            raise ValueError("Reviewer blocking issues must not be blank")
+        if review.verdict == "APPROVED":
+            if review.blocking_issues:
+                raise ValueError("Reviewer cannot approve changes with blocking issues")
+            if changes.status != "COMPLETED":
+                raise ValueError("Reviewer cannot approve escalated code changes")
+            if (
+                not test_results.passed
+                or test_results.exit_code != 0
+                or test_results.tests_failed > 0
+            ):
+                raise ValueError("Reviewer cannot approve changes with failing tests")
+            if spec.has_open_questions or spec.open_questions:
+                raise ValueError("Reviewer cannot approve a specification with open questions")
+            # Match the relative path normalization used by the Coder's scope check.
+            targets = {
+                path.strip().removeprefix("./").removeprefix("/") for path in spec.target_files
+            }
+            modified = {
+                path.strip().removeprefix("./").removeprefix("/") for path in changes.modified_files
+            }
+            if modified - targets:
+                raise ValueError(
+                    "Reviewer cannot approve changes outside the specification targets"
+                )
+        elif not review.blocking_issues:
+            raise ValueError("Reviewer must explain blocking issues when changes are not approved")
+
+        verdict = ReviewVerdict(task_id=data.task_id, **review.model_dump())
+        logger.info("reviewer.run_completed", task_id=data.task_id, verdict=verdict.verdict)
+        await self.event_sink.emit(
+            RunEvent(
+                task_id=data.task_id,
+                agent="reviewer",
+                event_type="reviewer.completed",
+                attempt=data.attempt,
+                payload={"verdict": verdict.verdict, "blocking_issues": verdict.blocking_issues},
+            )
+        )
+        return verdict

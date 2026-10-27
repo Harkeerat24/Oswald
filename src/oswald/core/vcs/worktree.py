@@ -186,6 +186,18 @@ class WorktreeManager:
         self._active_contexts[task_id] = context
         return context
 
+    async def apply_patch(self, task_id: str, patch_path: Path) -> None:
+        """Restore a saved cumulative patch in the task's isolated worktree."""
+        if task_id not in self._active_contexts:
+            raise WorktreeError(
+                "Patch restoration requires an active task worktree", task_id=task_id
+            )
+        resolved_patch = await asyncio.to_thread(patch_path.resolve)
+        await self._run_git(
+            ["apply", "--whitespace=nowarn", "--", str(resolved_patch)],
+            cwd=self.get_worktree_path(task_id),
+        )
+
     async def get_diff(self, task_id: str, base_ref: str | None = None) -> DiffResult:
         """Capture the unified git diff and modified files list for a task.
 

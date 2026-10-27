@@ -429,3 +429,71 @@ def test_usage_availability_distinguishes_missing_fields_from_reported_zero(miss
     translated = LiteLLMAdapter._translate_response(raw, "fake", 0.1)
     assert translated.provider_metadata["usage_available"] is (missing == "none")
     assert translated.usage.prompt_tokens == 0 and translated.usage.completion_tokens == 0
+
+
+async def test_request_pacing_includes_retries_and_concurrent_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from oswald.core.llm.adapters import litellm_adapter as adapter_module
+
+    now = [0.0]
+    starts: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        now[0] += delay
+
+    async def completion(**kwargs: Any) -> SimpleNamespace:
+        starts.append(now[0])
+        if len(starts) == 1:
+            raise RateLimitError(message="Slow down", llm_provider="gemini", model="test")
+        return _make_dummy_response()
+
+    monkeypatch.setattr(adapter_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(
+        adapter_module,
+        "asyncio",
+        SimpleNamespace(
+            Lock=asyncio.Lock,
+            timeout=asyncio.timeout,
+            sleep=sleep,
+        ),
+    )
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    adapter = LiteLLMAdapter(
+        api_key="test",
+        min_request_interval_seconds=13,
+        retry_config=RetryConfig(max_retries=1, base_delay_seconds=0, jitter_factor=0),
+    )
+    request = LLMRequest(model="fake/test", messages=[Message(role=Role.USER, content="Hi")])
+    results = await asyncio.gather(adapter.complete(request), adapter.complete(request))
+    assert all(result.content == "Test response" for result in results)
+    assert starts == [0, 13, 26]
+
+
+async def test_service_unavailable_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.exceptions import ServiceUnavailableError
+
+    completion = AsyncMock(
+        side_effect=[
+            ServiceUnavailableError(message="High demand", llm_provider="gemini", model="test"),
+            _make_dummy_response(),
+        ]
+    )
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    adapter = LiteLLMAdapter(
+        api_key="test",
+        retry_config=RetryConfig(max_retries=1, base_delay_seconds=0, jitter_factor=0),
+    )
+    result = await adapter.complete(
+        LLMRequest(model="fake/test", messages=[Message(role=Role.USER, content="Hi")])
+    )
+    assert result.content == "Test response"
+    assert completion.await_count == 2
+
+
+@pytest.mark.parametrize("interval", [-1, float("inf"), float("nan")])
+def test_invalid_request_interval_is_rejected(interval: float) -> None:
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        LiteLLMAdapter(api_key="test", min_request_interval_seconds=interval)

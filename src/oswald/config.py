@@ -32,6 +32,13 @@ class Settings(BaseSettings):
         validation_alias="LLM_MAX_RETRIES",
         description="Maximum retries for transient provider failures per completion",
     )
+    llm_min_request_interval_seconds: float = Field(
+        default=0,
+        ge=0,
+        allow_inf_nan=False,
+        validation_alias="LLM_MIN_REQUEST_INTERVAL_SECONDS",
+        description="Minimum spacing between provider requests, including retries, per client",
+    )
 
     # Agent model configurations (LiteLLM format, e.g., gemini/gemini-2.0-flash, gpt-4o, claude-3-5-sonnet-20241022)
     default_model: str = Field(

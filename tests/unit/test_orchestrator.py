@@ -157,6 +157,9 @@ async def test_success_persists_cumulative_patch_and_lineage(repo: Path, tmp_pat
     result = await h.pipeline.run("Change value")
     assert result.status == "SUCCEEDED"
     assert h.events == ["planner", "coder", "tester", "reviewer"]
+    for agent_input in h.inputs[1:]:
+        assert isinstance(agent_input, (CoderInput, TesterInput, ReviewerInput))
+        assert agent_input.baseline_context == "Change value"
     patch_text = Path(result.patch_path).read_text()
     assert "+value = 2" in patch_text and "test_app.py" in patch_text
     assert (repo / "app.py").read_text() == "uncommitted caller work\n"

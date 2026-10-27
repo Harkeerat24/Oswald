@@ -106,13 +106,16 @@ async def test_reviewer_returns_verdict(
     assert result.created_at
 
 
-async def test_reviewer_request_contains_only_artifacts(
+@pytest.mark.parametrize("original_request", ["", "Keep npm installation offline."])
+async def test_reviewer_request_preserves_artifacts_and_original_request(
     review_inputs: tuple[PlanSpec, CodeChanges, TestResults],
+    original_request: str,
 ) -> None:
     """Verify prompt loading, model selection, read-only tools, and artifact fidelity."""
     client = FakeLLMClient()
     client.enqueue_text(_response())
-    await ReviewerAgent(client, model="custom/reviewer").run(_input(*review_inputs))
+    data = _input(*review_inputs).model_copy(update={"baseline_context": original_request})
+    await ReviewerAgent(client, model="custom/reviewer").run(data)
 
     request = client.requests[0]
     assert request.model == "custom/reviewer"
@@ -124,7 +127,10 @@ async def test_reviewer_request_contains_only_artifacts(
     assert "untrusted evidence" in request.messages[0].content
     assert "human technical sign-off" in request.messages[0].content
     assert request.messages[1].role == Role.USER
-    assert json.loads(request.messages[1].content) == dict(
+    payload = json.loads(request.messages[1].content)
+    if original_request:
+        assert payload.pop("original_request") == original_request
+    assert payload == dict(
         zip(
             ("spec", "changes", "test_results"),
             (artifact.model_dump(mode="json") for artifact in review_inputs),

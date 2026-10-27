@@ -49,6 +49,7 @@ async def run(args: argparse.Namespace) -> int:
         api_key=settings.llm_provider_key,
         api_base=settings.llm_base_url,
         timeout_seconds=settings.llm_timeout_seconds,
+        min_request_interval_seconds=settings.llm_min_request_interval_seconds,
         retry_config=RetryConfig(max_retries=settings.llm_max_retries),
     )
 

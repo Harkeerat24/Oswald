@@ -46,7 +46,7 @@ class WorktreeManager:
 
         self.worktree_base_dir.mkdir(parents=True, exist_ok=True)
         self._timeout = command_timeout_seconds
-        self._log = structlog.get_logger().bind(component="vcs.worktree")
+        self._log = structlog.get_logger(component="vcs.worktree")
         self._active_contexts: dict[str, WorktreeContext] = {}
 
     def _validate_task_id(self, task_id: str) -> None:

@@ -14,10 +14,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from oswald.core.agents.coder import (
     BudgetGuard,
     EventSink,
-    InMemoryEventSink,
     NoOpBudgetGuard,
+    NoOpEventSink,
     RunEvent,
 )
+from oswald.core.agents.telemetry import agent_scope, complete, tool_call
 from oswald.core.artifacts.models import CodeChanges, PlanSpec, TestResults
 from oswald.core.codeindex.indexer import CodeIndexer
 from oswald.core.llm.exceptions import LLMError
@@ -39,7 +40,7 @@ from oswald.core.tools.tester import (
     write_test_file,
 )
 
-logger = structlog.get_logger().bind(component="agent.tester")
+logger = structlog.get_logger(component="agent.tester")
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "tester_system.md"
 _JSON_BLOCK_REGEX = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
@@ -81,7 +82,7 @@ class TesterAgent:
         self.sandbox = sandbox
         self.workspace_root = Path(workspace_root).resolve()
         self.budget_guard = budget_guard or NoOpBudgetGuard()
-        self.event_sink = event_sink or InMemoryEventSink()
+        self.event_sink = event_sink if event_sink is not None else NoOpEventSink()
         self.indexer = indexer
         self.model = model
         self.max_turns = max_turns
@@ -359,14 +360,14 @@ class TesterAgent:
         return tests_run, tests_failed
 
     async def run(self, data: TesterInput) -> TestResults:
+        """Run with bounded progress logging and exception-safe timer cleanup."""
+        async with agent_scope("tester", data.task_id, data.attempt) as progress:
+            result = await self._run(data)
+            progress.result(result)
+            return result
+
+    async def _run(self, data: TesterInput) -> TestResults:
         """Run the Tester turn loop and return mechanically grounded test results."""
-        logger.info(
-            "tester.run_started",
-            task_id=data.task_id,
-            attempt=data.attempt,
-            spec_target_files=data.spec.target_files,
-            modified_files=data.changes.modified_files,
-        )
 
         await self.event_sink.emit(
             RunEvent(
@@ -402,13 +403,15 @@ class TesterAgent:
             self.budget_guard.check(data.task_id)
 
             try:
-                response = await self.llm.complete(
+                response = await complete(
+                    self.llm,
                     LLMRequest(
                         model=self.model,
                         messages=messages,
                         tools=TESTER_TOOL_DEFINITIONS,
                         temperature=0.0,
-                    )
+                    ),
+                    turn=turn,
                 )
             except LLMError as exc:
                 logger.error("tester.llm_error", task_id=data.task_id, turn=turn, error=str(exc))
@@ -443,9 +446,11 @@ class TesterAgent:
 
                 circuit_broken = False
                 for call in response.tool_calls:
-                    output, tool_success, command_result = await self._execute_tool(
-                        call, forbidden_paths
-                    )
+                    with tool_call(call.name) as tool:
+                        output, tool_success, command_result = await self._execute_tool(
+                            call, forbidden_paths
+                        )
+                        tool.success = tool_success
 
                     if call.name == "write_test_file" and tool_success:
                         root = str(call.arguments.get("test_root") or "").strip("/")
@@ -644,17 +649,6 @@ class TesterAgent:
             test_files=test_files,
             output=output_text,
             content=content,
-        )
-
-        logger.info(
-            "tester.run_completed",
-            task_id=data.task_id,
-            passed=passed,
-            exit_code=exit_code,
-            tests_run=tests_run,
-            tests_failed=tests_failed,
-            test_files=test_files,
-            unauthorized_changes=changed,
         )
 
         await self.event_sink.emit(

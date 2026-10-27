@@ -20,12 +20,13 @@ from oswald.cli.__main__ import run
 from oswald.core.artifacts.models import PlanSpec, TestResults
 from oswald.core.artifacts.storage import FileSystemArtifactStore
 from oswald.core.llm.adapters.fake import FakeLLMClient
-from oswald.core.llm.types import LLMResponse, Role, StopReason, ToolCall
+from oswald.core.llm.types import LLMResponse, Role, StopReason, TokenUsage, ToolCall
 from oswald.core.orchestrator import RunResult
 from oswald.core.sandbox import DockerSandboxRuntime
 from oswald.core.sandbox.fake import FakeSandboxRuntime
 from oswald.core.sandbox.models import SandboxConfig
 from oswald.core.sandbox.protocol import SandboxRuntime
+from oswald.observability.logging import configure_logging
 
 
 def docker_ready() -> bool:
@@ -47,7 +48,13 @@ def docker_ready() -> bool:
 
 
 def enqueue_tools(client: FakeLLMClient, *calls: ToolCall) -> None:
-    client.enqueue(LLMResponse(tool_calls=list(calls), stop_reason=StopReason.TOOL_USE))
+    client.enqueue(
+        LLMResponse(
+            tool_calls=list(calls),
+            stop_reason=StopReason.TOOL_USE,
+            usage=TokenUsage(prompt_tokens=20, completion_tokens=5),
+        )
+    )
 
 
 @pytest.mark.parametrize("docker", [False, pytest.param(True, marks=pytest.mark.integration)])
@@ -222,14 +229,41 @@ async def test_real_agents_complete_and_correct(
             "oswald.cli.__main__.DockerSandboxRuntime",
             side_effect=sandbox,
         ),
+        configure_logging(output),
     ):
         code = await run(args)
-    # Core structured logging may be configured by other tests; CLI JSON is also on disk.
-    capsys.readouterr()
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    assert printed["status"] == "SUCCEEDED"
+    assert "PLANNER" in captured.err and "REVIEWER" in captured.err
+    assert "tool_calls=" in captured.err and "tokens=" in captured.err
+    entries = [json.loads(line) for line in (output / "progress.jsonl").read_text().splitlines()]
+    assert entries[-1]["event"] == "run.completed"
+    assert entries[-1]["tests_run"] == 1 and entries[-1]["tests_failed"] == 0
+    assert entries[-1]["verdict"] == "APPROVED"
     manifest = next(output.glob("*/run.json"))
     result = RunResult.model_validate_json(manifest.read_text())
     assert code == 0 and result.status == "SUCCEEDED", result.reason
     assert result.attempts == len(edits)
+    assert result.metrics.llm_calls == llm.call_count
+    assert result.metrics.tool_calls == 7 + int(docker) + (2 if correction else 0)
+    assert result.metrics.tokens_in is not None and result.metrics.tokens_in > 0
+    assert result.metrics.tokens_out is not None and result.metrics.tokens_out > 0
+    assert len(result.metrics.agents) == (7 if correction else 4)
+    assert printed["metrics"] == result.metrics.model_dump()
+    for key in ("tokens_in", "tokens_out", "tool_calls", "llm_calls"):
+        assert entries[-1][key] == getattr(result.metrics, key)
+    completed = [
+        entry
+        for entry in entries
+        if entry["event"]
+        in {
+            "agent.completed",
+            "agent.failed",
+            "agent.stopped",
+        }
+    ]
+    assert len(completed) == len(result.metrics.agents)
     assert [r.model for r in llm.requests[:2]] == ["fake/planner", "fake/planner"]
     inspected = next(m.content for m in llm.requests[1].messages if m.tool_call_id == "inspect")
     assert "return 1" in inspected and "999" not in inspected

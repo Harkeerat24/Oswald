@@ -191,7 +191,16 @@ cat /tmp/oswald-demo-result.json
 
 A successful result has `status: "SUCCEEDED"`, `stage: "reviewer"`, and the reason
 `Tests passed and Reviewer approved`. It also contains the task ID, attempt count,
-base commit, saved patch path, artifact references, and cleanup errors.
+base commit, saved patch path, artifact references, cleanup errors, and aggregate
+and per-agent-attempt `metrics`.
+
+Progress logs show the active agent, elapsed time, cumulative input/output tokens,
+and attempted tool calls. Quiet agents report their current action every 10 seconds;
+use `--progress-interval 2` to change that interval or `--verbose` for more detail.
+Logs remain on stderr, and rotating structured logs are saved to
+`.oswald/runs/progress.jsonl` (under your chosen `--output`). Missing token usage
+appears as `unknown`, rather than zero. See [the progress logging guide](docs/orchestrator.md#reading-agent-progress-logs)
+for counting rules, retention, and examples.
 
 Exit code `0` means success; `1` means the run stopped or failed. Planning questions,
 Coder escalation, and Reviewer rejection stop the run. Test failures or review

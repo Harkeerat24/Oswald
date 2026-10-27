@@ -10,6 +10,7 @@ from typing import Any, Protocol, runtime_checkable
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
+from oswald.core.agents.telemetry import agent_scope, complete, tool_call
 from oswald.core.artifacts.models import CodeChanges, Finding, PlanSpec
 from oswald.core.codeindex.indexer import CodeIndexer
 from oswald.core.llm.exceptions import LLMError
@@ -36,7 +37,7 @@ from oswald.core.tools.coder import (
 )
 from oswald.core.vcs.workspace import WorkspaceDiff
 
-logger = structlog.get_logger().bind(component="agent.coder")
+logger = structlog.get_logger(component="agent.coder")
 
 
 class BudgetExceededError(RuntimeError):
@@ -77,6 +78,13 @@ class EventSink(Protocol):
     """Sink for recording agent runtime telemetry events."""
 
     async def emit(self, event: RunEvent) -> None: ...
+
+
+class NoOpEventSink:
+    """Default sink: emit structured progress logs without retaining raw events."""
+
+    async def emit(self, event: RunEvent) -> None:
+        pass
 
 
 class InMemoryEventSink:
@@ -128,7 +136,7 @@ class CoderAgent:
         self.workspace_diff = workspace_diff
         self.workspace_root = Path(workspace_root).resolve()
         self.budget_guard: BudgetGuard = budget_guard or NoOpBudgetGuard()
-        self.event_sink: EventSink = event_sink or InMemoryEventSink()
+        self.event_sink: EventSink = event_sink if event_sink is not None else NoOpEventSink()
         self.indexer = indexer
         self.model = model
         self.max_turns = max_turns
@@ -294,6 +302,13 @@ class CoderAgent:
         return None
 
     async def run(self, input_data: CoderInput) -> CodeChanges:
+        """Run with bounded progress logging and exception-safe timer cleanup."""
+        async with agent_scope("coder", input_data.task_id, input_data.attempt) as progress:
+            result = await self._run(input_data)
+            progress.result(result)
+            return result
+
+    async def _run(self, input_data: CoderInput) -> CodeChanges:
         """Run the Coder agent turn loop to implement spec changes."""
         await self.event_sink.emit(
             RunEvent(
@@ -314,13 +329,15 @@ class CoderAgent:
             self.budget_guard.check(input_data.task_id)
 
             try:
-                response = await self.llm.complete(
+                response = await complete(
+                    self.llm,
                     LLMRequest(
                         model=self.model,
                         messages=messages,
                         tools=CODER_TOOL_DEFINITIONS,
                         temperature=0.0,
-                    )
+                    ),
+                    turn=turn,
                 )
             except LLMError as exc:
                 final_draft = {
@@ -357,9 +374,11 @@ class CoderAgent:
 
                 circuit_broken = False
                 for tc in response.tool_calls:
-                    output_text, success = await self._execute_tool_call(
-                        tc, input_data.spec.target_files, input_data.task_id
-                    )
+                    with tool_call(tc.name) as tool:
+                        output_text, success = await self._execute_tool_call(
+                            tc, input_data.spec.target_files, input_data.task_id
+                        )
+                        tool.success = success
 
                     # Circuit breaker check: detect 3 repeated identical failures
                     call_sig = f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True)}"

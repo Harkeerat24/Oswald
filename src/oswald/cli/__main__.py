@@ -4,11 +4,10 @@ import argparse
 import asyncio
 import importlib
 import json
+import math
 import sys
 from pathlib import Path
 from typing import cast
-
-import structlog
 
 from oswald.config import Settings
 from oswald.core.agents.coder import CoderAgent
@@ -22,6 +21,7 @@ from oswald.core.orchestrator.planner import PlannerAdapter
 from oswald.core.sandbox import DockerSandboxRuntime
 from oswald.core.sandbox.protocol import SandboxRuntime
 from oswald.core.vcs.workspace import WorkspaceDiff
+from oswald.observability.logging import configure_logging
 
 
 class SavedPlanPlanner:
@@ -80,10 +80,18 @@ async def run(args: argparse.Namespace) -> int:
         DockerSandboxRuntime,
         image=args.image,
         stage_timeout=args.stage_timeout,
+        progress_interval=getattr(args, "progress_interval", 10),
     )
     result = await orchestrator.run(args.request, base_ref=args.base_ref)
     print(result.model_dump_json(indent=2))
     return 0 if result.status == "SUCCEEDED" else 1
+
+
+def _progress_interval(value: str) -> float:
+    interval = float(value)
+    if not math.isfinite(interval) or interval <= 0:
+        raise argparse.ArgumentTypeError("Progress interval must be finite and positive")
+    return interval
 
 
 def main() -> int:
@@ -102,6 +110,15 @@ def main() -> int:
         help="Prebuilt image containing project/test dependencies",
     )
     parser.add_argument("--stage-timeout", type=float, default=1800)
+    parser.add_argument(
+        "--progress-interval",
+        type=_progress_interval,
+        default=10,
+        help="Seconds between progress logs during quiet agent operations (default: 10)",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Include provider request debug logs"
+    )
     planner = parser.add_mutually_exclusive_group()
     planner.add_argument(
         "--plan",
@@ -112,9 +129,9 @@ def main() -> int:
         help="Override Planner with module:function; factory receives isolated workspace Path",
     )
     args = parser.parse_args()
-    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
     try:
-        return asyncio.run(run(args))
+        with configure_logging(Path(args.output), verbose=args.verbose):
+            return asyncio.run(run(args))
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

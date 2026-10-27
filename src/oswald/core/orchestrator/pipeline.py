@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from oswald.core.agents.coder import CoderInput
 from oswald.core.agents.reviewer import ReviewerInput
+from oswald.core.agents.telemetry import RunProgress, RunStats, agent_scope
 from oswald.core.agents.tester import TesterInput
 from oswald.core.artifacts.models import (
     ArtifactRef,
@@ -62,6 +64,7 @@ class RunResult(BaseArtifact):
     patch_path: str = ""
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     cleanup_errors: list[str] = Field(default_factory=list)
+    metrics: RunStats = Field(default_factory=RunStats)
 
 
 AgentFactory = Callable[[Path, SandboxRuntime, WorkspaceDiff], Agents]
@@ -84,6 +87,7 @@ class Orchestrator:
         *,
         image: str = "python:3.12-slim",
         stage_timeout: float = 1800,
+        progress_interval: float = 10,
     ) -> None:
         if stage_timeout <= 0:
             raise ValueError("stage_timeout must be positive")
@@ -94,11 +98,16 @@ class Orchestrator:
         self.sandbox = sandbox
         self.image = image
         self.stage_timeout = stage_timeout
+        # Validate before allocating a workspace or starting a run.
+        RunProgress("", interval=progress_interval)
+        self.progress_interval = progress_interval
 
     async def run(self, request: str, *, base_ref: str = "HEAD") -> RunResult:
         if not request.strip():
             raise ValueError("Task request must not be blank")
         task_id = uuid4().hex
+        progress = RunProgress(task_id, interval=self.progress_interval)
+        logger = structlog.get_logger()
         report_dir = self.output_dir / task_id
         await asyncio.to_thread(report_dir.mkdir, parents=True, exist_ok=False)
         manager: WorktreeManager | None = None
@@ -112,6 +121,8 @@ class Orchestrator:
         reason = ""
         patch_path = ""
         cleanup_errors: list[str] = []
+        latest_tests: TestResults | None = None
+        latest_review: ReviewVerdict | None = None
 
         async def save[T: BaseArtifact](name: str, artifact: T, model: type[T]) -> T:
             # Revalidate even model_construct()/model_copy() outputs at every handoff.
@@ -139,6 +150,13 @@ class Orchestrator:
             async with asyncio.timeout(self.stage_timeout):
                 return await operation
 
+        async def invoke[T](operation: Awaitable[T]) -> T:
+            async with agent_scope(stage, task_id, max(attempt, 1), run=progress) as agent_progress:
+                value = await call(operation)
+                agent_progress.result(value)
+                return value
+
+        logger.info("run.started", task_id=task_id, image=self.image)
         try:
             manager = WorktreeManager(self.repo_path, report_dir / "workspace")
             context = await call(manager.create_worktree(task_id, base_ref=base_ref))
@@ -161,7 +179,7 @@ class Orchestrator:
             agents = self.agents(root, runtime, diff)
             spec = await save(
                 "spec",
-                await call(
+                await invoke(
                     agents.planner.run(
                         PlannerInput(
                             task_id=task_id,
@@ -181,7 +199,7 @@ class Orchestrator:
                     stage = "coder"
                     changes = await save(
                         "code_changes",
-                        await call(
+                        await invoke(
                             agents.coder.run(
                                 CoderInput(
                                     task_id=task_id,
@@ -199,7 +217,7 @@ class Orchestrator:
                     stage = "tester"
                     tests = await save(
                         "test_results",
-                        await call(
+                        await invoke(
                             agents.tester.run(
                                 TesterInput(
                                     task_id=task_id,
@@ -211,6 +229,7 @@ class Orchestrator:
                         ),
                         TestResults,
                     )
+                    latest_tests = tests
                     if tests.execution_error:
                         status, reason = "FAILED", tests.execution_error
                         break
@@ -221,7 +240,7 @@ class Orchestrator:
                     stage = "reviewer"
                     review = await save(
                         "review",
-                        await call(
+                        await invoke(
                             agents.reviewer.run(
                                 ReviewerInput(
                                     task_id=task_id,
@@ -234,6 +253,7 @@ class Orchestrator:
                         ),
                         ReviewVerdict,
                     )
+                    latest_review = review
                     clean_tests = tests.passed and tests.exit_code == 0 and tests.tests_failed == 0
                     if review.verdict == "REJECTED":
                         reason = review.summary + ": " + "; ".join(review.blocking_issues)
@@ -325,10 +345,34 @@ class Orchestrator:
                 patch_path=patch_path,
                 artifacts=refs,
                 cleanup_errors=cleanup_errors,
+                metrics=progress.snapshot(),
             )
             await asyncio.to_thread(
                 (report_dir / "run.json").write_text,
                 result.model_dump_json(indent=2),
                 encoding="utf-8",
+            )
+            totals = result.metrics.model_dump(exclude={"agents"})
+            verification: dict[str, str | int] = {}
+            if latest_tests is not None:
+                verification.update(
+                    tests_run=latest_tests.tests_run, tests_failed=latest_tests.tests_failed
+                )
+            if latest_review is not None:
+                verification["verdict"] = latest_review.verdict
+            if status != "SUCCEEDED":
+                verification["reason"] = reason[:200]
+            logger.log(
+                20 if status == "SUCCEEDED" else 40 if status == "FAILED" else 30,
+                "run.completed",
+                task_id=task_id,
+                status=status,
+                stage=stage,
+                attempts=attempt,
+                patch_path=patch_path,
+                report_path=str(report_dir / "run.json"),
+                cleanup_errors=len(cleanup_errors),
+                **totals,
+                **verification,
             )
         return result

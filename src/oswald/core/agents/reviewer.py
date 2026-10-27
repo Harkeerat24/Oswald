@@ -3,16 +3,16 @@
 import json
 from pathlib import Path
 
-import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from oswald.core.agents.coder import (
     BudgetGuard,
     EventSink,
-    InMemoryEventSink,
     NoOpBudgetGuard,
+    NoOpEventSink,
     RunEvent,
 )
+from oswald.core.agents.telemetry import agent_scope, complete
 from oswald.core.artifacts.models import (
     CodeChanges,
     PlanSpec,
@@ -23,7 +23,6 @@ from oswald.core.artifacts.models import (
 from oswald.core.llm.protocol import LLMClient
 from oswald.core.llm.types import LLMRequest, Message, Role, StopReason
 
-logger = structlog.get_logger().bind(component="agent.reviewer")
 _DEFAULT_PROMPT_PATH = Path(__file__).parent / "prompts" / "reviewer_system.md"
 
 
@@ -71,10 +70,17 @@ class ReviewerAgent:
         self.llm = llm
         self.model = model
         self.budget_guard = budget_guard or NoOpBudgetGuard()
-        self.event_sink = event_sink or InMemoryEventSink()
+        self.event_sink = event_sink if event_sink is not None else NoOpEventSink()
         self.prompt_path = prompt_path or _DEFAULT_PROMPT_PATH
 
     async def run(self, data: ReviewerInput) -> ReviewVerdict:
+        """Run with bounded progress logging and exception-safe timer cleanup."""
+        async with agent_scope("reviewer", data.task_id, data.attempt) as progress:
+            result = await self._run(data)
+            progress.result(result)
+            return result
+
+    async def _run(self, data: ReviewerInput) -> ReviewVerdict:
         """Return a validated review for artifacts belonging to the same task.
 
         Raises:
@@ -89,7 +95,6 @@ class ReviewerAgent:
             raise ValueError("Reviewer input artifacts must belong to the same task")
 
         self.budget_guard.check(data.task_id)
-        logger.info("reviewer.run_started", task_id=data.task_id, attempt=data.attempt)
         await self.event_sink.emit(
             RunEvent(
                 task_id=data.task_id,
@@ -115,7 +120,7 @@ class ReviewerAgent:
                 ),
             ],
         )
-        response = await self.llm.complete(request)
+        response = await complete(self.llm, request)
         await self.event_sink.emit(
             RunEvent(
                 task_id=data.task_id,
@@ -166,7 +171,6 @@ class ReviewerAgent:
             raise ValueError("Reviewer must explain blocking issues when changes are not approved")
 
         verdict = ReviewVerdict(task_id=data.task_id, **review.model_dump())
-        logger.info("reviewer.run_completed", task_id=data.task_id, verdict=verdict.verdict)
         await self.event_sink.emit(
             RunEvent(
                 task_id=data.task_id,

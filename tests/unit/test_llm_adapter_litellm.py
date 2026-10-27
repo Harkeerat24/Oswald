@@ -417,3 +417,15 @@ async def test_deepseek_flash_uses_content_mode(
         LLMRequest(model=model, messages=[Message(role=Role.USER, content="Hi")]),
     )
     assert complete.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize("missing", ["usage", "prompt_tokens", "completion_tokens", "none"])
+def test_usage_availability_distinguishes_missing_fields_from_reported_zero(missing: str) -> None:
+    raw = _make_dummy_response(prompt_tokens=0, completion_tokens=0)
+    if missing == "usage":
+        del raw.usage
+    elif missing != "none":
+        delattr(raw.usage, missing)
+    translated = LiteLLMAdapter._translate_response(raw, "fake", 0.1)
+    assert translated.provider_metadata["usage_available"] is (missing == "none")
+    assert translated.usage.prompt_tokens == 0 and translated.usage.completion_tokens == 0

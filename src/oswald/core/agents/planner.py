@@ -14,10 +14,11 @@ from oswald.config import Settings
 from oswald.core.agents.coder import (
     BudgetGuard,
     EventSink,
-    InMemoryEventSink,
     NoOpBudgetGuard,
+    NoOpEventSink,
     RunEvent,
 )
+from oswald.core.agents.telemetry import agent_scope, complete, tool_call
 from oswald.core.artifacts.models import PlanSpec, TaskItem
 from oswald.core.codeindex.indexer import CodeIndexer
 from oswald.core.llm.exceptions import LLMError
@@ -37,7 +38,7 @@ from oswald.core.tools.planner import (
     search_code,
 )
 
-logger = structlog.get_logger().bind(component="agent.planner")
+logger = structlog.get_logger(component="agent.planner")
 _DEFAULT_PROMPT_PATH = Path(__file__).parent / "prompts" / "planner_system.md"
 _JSON_BLOCK_REGEX = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
@@ -78,7 +79,7 @@ class PlannerAgent:
         self.llm = llm
         self.workspace_root = Path(workspace_root).resolve()
         self.budget_guard: BudgetGuard = budget_guard or NoOpBudgetGuard()
-        self.event_sink: EventSink = event_sink or InMemoryEventSink()
+        self.event_sink: EventSink = event_sink if event_sink is not None else NoOpEventSink()
         self.indexer = indexer
         self.model = model or Settings().planner_model
         self.max_turns = max_turns
@@ -232,6 +233,13 @@ class PlannerAgent:
         )
 
     async def run(self, input_data: PlannerInput) -> PlanSpec:
+        """Run with bounded progress logging and exception-safe timer cleanup."""
+        async with agent_scope("planner", input_data.task_id, input_data.attempt) as progress:
+            result = await self._run(input_data)
+            progress.result(result)
+            return result
+
+    async def _run(self, input_data: PlannerInput) -> PlanSpec:
         """Run the Planner agent turn loop to investigate workspace and return a PlanSpec."""
         await self.event_sink.emit(
             RunEvent(
@@ -251,13 +259,15 @@ class PlannerAgent:
             self.budget_guard.check(input_data.task_id)
 
             try:
-                response = await self.llm.complete(
+                response = await complete(
+                    self.llm,
                     LLMRequest(
                         model=self.model,
                         messages=messages,
                         tools=PLANNER_TOOL_DEFINITIONS,
                         temperature=0.2,
-                    )
+                    ),
+                    turn=turn,
                 )
             except LLMError as err:
                 logger.error("planner.llm_error", turn=turn, error=str(err))
@@ -292,7 +302,11 @@ class PlannerAgent:
                             payload={"tool": tc.name, "arguments": tc.arguments},
                         )
                     )
-                    tool_output = self._execute_read_only_tool(tc)
+                    with tool_call(tc.name) as tool:
+                        tool_output = self._execute_read_only_tool(tc)
+                        tool.success = not tool_output.startswith(
+                            ("Error:", "Tool Execution Error")
+                        )
                     messages.append(
                         Message(
                             role=Role.TOOL,

@@ -191,10 +191,40 @@ means the automated Reviewer approved; it does not substitute for human approval
 If patch/log saving or container teardown fails, the result records the failure
 and retains the worktree for recovery. Do not remove it until you recover the changes.
 
+## Continue a task
+
+Resume a failed, cancelled (Ctrl-C), or stopped run with its printed task ID:
+
+```bash
+uv run python -m oswald.cli continue <task-id>
+```
+
+Use the same `--output` directory (default `.oswald/runs`). New runs remember
+the source repository and sandbox image automatically. For older runs, supply
+the original `--repo` and `--image`. The command restores the saved patch on the original base
+commit and keeps the same task ID. A failed Tester resumes at Tester; a failed
+Reviewer reuses the saved passing/failing test report and resumes at Reviewer.
+Completed Planner and Coder outputs are reused. The unfinished agent starts a new
+agent call; its internal conversation/tool loop is not resumed.
+
+After the correction limit or a Reviewer rejection, continuing sends the saved
+findings to Coder for another bounded invocation (at most two Coder attempts).
+Attempt numbers continue increasing. A Coder escalation retries Coder; planning
+questions retry Planner. Successful runs return the saved result without agent
+calls. Earlier outcomes are preserved as `run-<id>.json`, and artifact versions
+remain in the store.
+
+This uses the saved `run.json`, `request.json`, artifacts, and `final.patch`, so it
+also supports runs produced before this command existed. Abrupt process kills
+without a saved terminal report are unsupported. Runs with cleanup errors require
+recovery of their retained workspace first. Do not continue a task while another
+invocation of that task is running.
+
 ## Programmatic use and optional Planner overrides
 
 For programmatic use, inject an `Agents` factory and a `SandboxRuntime` factory into
-`Orchestrator`, then `await orchestrator.run(request, base_ref="HEAD")`. Wrap a
+`Orchestrator`, then `await orchestrator.run(request, base_ref="HEAD")` or
+`await orchestrator.continue_task(task_id)`. Wrap a
 `PlannerAgent` with `PlannerAdapter`. Import the orchestration types from
 `oswald.core.orchestrator` and `PlannerAgent` from `oswald.core.agents`. Construct
 `PlannerAgent` with the `root` path supplied
@@ -228,7 +258,7 @@ and persists the returned specification regardless of which Planner is used.
 | Tester infrastructure/agent failure | Fail at Tester; no correction |
 | Reviewer `REJECTED` | Stop at Reviewer; no correction |
 | Failed tests or Reviewer `CHANGES_REQUESTED` | Send findings to Coder once, then rerun Tester and Reviewer |
-| Second unsuccessful attempt | Stop; never run a third Coder attempt |
+| Second unsuccessful attempt | Stop this invocation; `continue` can start another bounded invocation |
 | Passing tests plus Reviewer `APPROVED` with no blockers | Succeed |
 
 Reviewer runs after normal test failures to supply additional findings. A rejection

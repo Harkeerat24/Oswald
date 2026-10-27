@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
@@ -65,6 +65,10 @@ class RunResult(BaseArtifact):
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     cleanup_errors: list[str] = Field(default_factory=list)
     metrics: RunStats = Field(default_factory=RunStats)
+    repo_path: str = ""
+    image: str = ""
+    resume_stage: str = ""
+    findings: list[Finding] = Field(default_factory=list)
 
 
 AgentFactory = Callable[[Path, SandboxRuntime, WorkspaceDiff], Agents]
@@ -102,24 +106,60 @@ class Orchestrator:
         RunProgress("", interval=progress_interval)
         self.progress_interval = progress_interval
 
+    async def continue_task(self, task_id: str) -> RunResult:
+        """Restore a finished invocation and retry its unfinished stage, without replanning."""
+        if UUID(task_id).hex != task_id:
+            raise ValueError("Expected the task ID printed by the orchestrator")
+        report_dir = self.output_dir / task_id
+        previous = RunResult.model_validate_json(
+            await asyncio.to_thread((report_dir / "run.json").read_text, encoding="utf-8")
+        )
+        if previous.task_id != task_id:
+            raise ValueError("Saved run belongs to another task")
+        if previous.status == "SUCCEEDED":
+            return previous
+        if previous.cleanup_errors:
+            raise ValueError("Recover the retained workspace/cleanup errors before continuing")
+        data = PlannerInput.model_validate_json(
+            await asyncio.to_thread((report_dir / "request.json").read_text, encoding="utf-8")
+        )
+        if data.task_id != task_id or data.base_commit != previous.base_commit:
+            raise ValueError("Saved request does not match the run")
+        # Keep the preceding outcome reviewable even after run.json is updated.
+        await asyncio.to_thread(
+            shutil.copyfile, report_dir / "run.json", report_dir / f"run-{uuid4().hex}.json"
+        )
+        return await self._run(data.request, base_ref=data.base_commit, previous=previous)
+
     async def run(self, request: str, *, base_ref: str = "HEAD") -> RunResult:
+        return await self._run(request, base_ref=base_ref)
+
+    async def _run(
+        self, request: str, *, base_ref: str, previous: RunResult | None = None
+    ) -> RunResult:
         if not request.strip():
             raise ValueError("Task request must not be blank")
-        task_id = uuid4().hex
+        task_id = previous.task_id if previous else uuid4().hex
         progress = RunProgress(task_id, interval=self.progress_interval)
         logger = structlog.get_logger()
         report_dir = self.output_dir / task_id
-        await asyncio.to_thread(report_dir.mkdir, parents=True, exist_ok=False)
+        await asyncio.to_thread(report_dir.mkdir, parents=True, exist_ok=previous is not None)
         manager: WorktreeManager | None = None
         runtime: SandboxRuntime | None = None
         root: Path | None = None
-        base_commit = ""
+        base_commit = previous.base_commit if previous else ""
         stage = "workspace"
-        attempt = 0
-        refs: list[ArtifactRef] = []
+        attempt = previous.attempts if previous else 0
+        refs: list[ArtifactRef] = list(previous.artifacts) if previous else []
+        resume_stage = (previous.resume_stage or previous.stage) if previous else "planner"
+        findings = list(previous.findings) if previous else []
+        workspace_restored = previous is None or not previous.patch_path
+        start_attempt = max(previous.attempts, 1) if previous else 1
+        repo_path = Path(previous.repo_path) if previous and previous.repo_path else self.repo_path
+        image = previous.image if previous and previous.image else self.image
         status: Literal["SUCCEEDED", "STOPPED", "FAILED", "CANCELLED"] = "STOPPED"
         reason = ""
-        patch_path = ""
+        patch_path = previous.patch_path if previous else ""
         cleanup_errors: list[str] = []
         latest_tests: TestResults | None = None
         latest_review: ReviewVerdict | None = None
@@ -146,6 +186,37 @@ class Orchestrator:
             )
             return validated
 
+        async def saved[T: BaseArtifact](name: str, model: type[T]) -> T:
+            ref = next(ref for ref in reversed(refs) if ref.name == name)
+            artifact = await self.store.load(ref, model)
+            if artifact.task_id != task_id:
+                raise ValueError(f"{name} belongs to another task")
+            return artifact
+
+        def corrections(tests: TestResults, review: ReviewVerdict) -> list[Finding]:
+            findings = []
+            if not (tests.passed and tests.exit_code == 0 and tests.tests_failed == 0):
+                findings.append(
+                    Finding(
+                        source="tester",
+                        severity="major",
+                        problem=tests.content,
+                        evidence=tests.output[-500:],
+                        expected_correction="Correct the implementation so the tests pass.",
+                    )
+                )
+            if review.verdict != "APPROVED" or review.blocking_issues:
+                findings.extend(
+                    Finding(
+                        source="reviewer",
+                        severity="major",
+                        problem=issue,
+                        expected_correction=review.content,
+                    )
+                    for issue in (review.blocking_issues or [review.summary])
+                )
+            return findings
+
         async def call[T](operation: Awaitable[T]) -> T:
             async with asyncio.timeout(self.stage_timeout):
                 return await operation
@@ -156,9 +227,22 @@ class Orchestrator:
                 agent_progress.result(value)
                 return value
 
-        logger.info("run.started", task_id=task_id, image=self.image)
+        logger.info("run.started", task_id=task_id, image=image)
         try:
-            manager = WorktreeManager(self.repo_path, report_dir / "workspace")
+            if previous and previous.status == "STOPPED" and resume_stage in {"tester", "reviewer"}:
+                findings = corrections(
+                    await saved("test_results", TestResults),
+                    await saved("review", ReviewVerdict),
+                )
+                start_attempt += 1
+                resume_stage = "coder"
+            if previous and resume_stage == "coder" and start_attempt > 1 and not findings:
+                findings = corrections(
+                    await saved("test_results", TestResults),
+                    await saved("review", ReviewVerdict),
+                )
+            attempt = start_attempt if previous else 0
+            manager = WorktreeManager(repo_path, report_dir / "workspace")
             context = await call(manager.create_worktree(task_id, base_ref=base_ref))
             root = context.worktree_path
             base_commit = context.base_ref
@@ -169,66 +253,81 @@ class Orchestrator:
                 ).model_dump_json(indent=2),
                 encoding="utf-8",
             )
+            if previous and previous.patch_path:
+                target = report_dir / "final.patch"
+                if await asyncio.to_thread(target.read_bytes):
+                    await call(manager.apply_patch(task_id, target))
+            workspace_restored = True
             stage = "sandbox"
-            runtime = self.sandbox(
-                SandboxConfig(task_id=task_id, workspace_path=root, image=self.image)
-            )
+            runtime = self.sandbox(SandboxConfig(task_id=task_id, workspace_path=root, image=image))
             await call(runtime.start())
             diff = WorktreeWorkspaceDiff(manager)
             stage = "planner"
             agents = self.agents(root, runtime, diff)
-            spec = await save(
-                "spec",
-                await invoke(
-                    agents.planner.run(
-                        PlannerInput(
-                            task_id=task_id,
-                            request=request,
-                            workspace_root=root,
-                            base_commit=base_commit,
+            if previous and resume_stage not in {"workspace", "sandbox", "planner"}:
+                spec = await saved("spec", PlanSpec)
+            else:
+                spec = await save(
+                    "spec",
+                    await invoke(
+                        agents.planner.run(
+                            PlannerInput(
+                                task_id=task_id,
+                                request=request,
+                                workspace_root=root,
+                                base_commit=base_commit,
+                            )
                         )
-                    )
-                ),
-                PlanSpec,
-            )
+                    ),
+                    PlanSpec,
+                )
             if spec.has_open_questions or spec.open_questions:
                 reason = "Unresolved planning questions: " + "; ".join(spec.open_questions)
             else:
-                findings: list[Finding] = []
-                for attempt in (1, 2):
+                for attempt in range(start_attempt, start_attempt + 2):
                     stage = "coder"
-                    changes = await save(
-                        "code_changes",
-                        await invoke(
-                            agents.coder.run(
-                                CoderInput(
-                                    task_id=task_id,
-                                    attempt=attempt,
-                                    spec=spec,
-                                    findings=findings,
+                    if (
+                        previous
+                        and attempt == start_attempt
+                        and resume_stage in {"tester", "reviewer"}
+                    ):
+                        changes = await saved("code_changes", CodeChanges)
+                    else:
+                        changes = await save(
+                            "code_changes",
+                            await invoke(
+                                agents.coder.run(
+                                    CoderInput(
+                                        task_id=task_id,
+                                        attempt=attempt,
+                                        spec=spec,
+                                        findings=findings,
+                                    )
                                 )
-                            )
-                        ),
-                        CodeChanges,
-                    )
+                            ),
+                            CodeChanges,
+                        )
                     if changes.status == "ESCALATED":
                         reason = changes.escalation or changes.summary
                         break
                     stage = "tester"
-                    tests = await save(
-                        "test_results",
-                        await invoke(
-                            agents.tester.run(
-                                TesterInput(
-                                    task_id=task_id,
-                                    attempt=attempt,
-                                    spec=spec,
-                                    changes=changes,
+                    if previous and attempt == start_attempt and resume_stage == "reviewer":
+                        tests = await saved("test_results", TestResults)
+                    else:
+                        tests = await save(
+                            "test_results",
+                            await invoke(
+                                agents.tester.run(
+                                    TesterInput(
+                                        task_id=task_id,
+                                        attempt=attempt,
+                                        spec=spec,
+                                        changes=changes,
+                                    )
                                 )
-                            )
-                        ),
-                        TestResults,
-                    )
+                            ),
+                            TestResults,
+                        )
                     latest_tests = tests
                     if tests.execution_error:
                         status, reason = "FAILED", tests.execution_error
@@ -266,30 +365,10 @@ class Orchestrator:
                         reason = "Tests failed: " + tests.content
                     else:
                         reason = review.summary + ": " + "; ".join(review.blocking_issues)
-                    if attempt == 2:
-                        reason = "Correction limit reached (2 total attempts). " + reason
+                    if attempt == start_attempt + 1:
+                        reason = "Correction limit reached (2 attempts per invocation). " + reason
                         break
-                    findings = []
-                    if not clean_tests:
-                        findings.append(
-                            Finding(
-                                source="tester",
-                                severity="major",
-                                problem=tests.content,
-                                evidence=tests.output[-500:],
-                                expected_correction="Correct the implementation so the tests pass.",
-                            )
-                        )
-                    if review.verdict != "APPROVED" or review.blocking_issues:
-                        findings.extend(
-                            Finding(
-                                source="reviewer",
-                                severity="major",
-                                problem=issue,
-                                expected_correction=review.content,
-                            )
-                            for issue in (review.blocking_issues or [review.summary])
-                        )
+                    findings = corrections(tests, review)
         except asyncio.CancelledError:
             status, reason = "CANCELLED", f"Cancelled during {stage}"
             raise
@@ -311,12 +390,20 @@ class Orchestrator:
                 candidate = manager.get_worktree_path(task_id)
                 if await asyncio.to_thread(candidate.is_dir):
                     root = candidate
-            if root is not None and manager is not None:
+            if root is not None and not workspace_restored:
+                cleanup_errors.append(
+                    f"restore failed; saved patch preserved, worktree retained at {root}"
+                )
+            if root is not None and manager is not None and workspace_restored:
                 try:
                     logs = root / ".oswald" / "logs"
                     if await asyncio.to_thread(logs.is_dir):
                         await asyncio.to_thread(
-                            shutil.copytree, logs, report_dir / "logs", symlinks=True
+                            shutil.copytree,
+                            logs,
+                            report_dir / "logs",
+                            symlinks=True,
+                            dirs_exist_ok=True,
                         )
                     final_diff = await call(manager.get_diff(task_id))
                     target = report_dir / "final.patch"
@@ -346,6 +433,10 @@ class Orchestrator:
                 artifacts=refs,
                 cleanup_errors=cleanup_errors,
                 metrics=progress.snapshot(),
+                repo_path=str(repo_path),
+                image=image,
+                resume_stage=resume_stage if stage in {"workspace", "sandbox"} else stage,
+                findings=findings,
             )
             await asyncio.to_thread(
                 (report_dir / "run.json").write_text,

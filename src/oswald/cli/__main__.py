@@ -82,7 +82,10 @@ async def run(args: argparse.Namespace) -> int:
         stage_timeout=args.stage_timeout,
         progress_interval=getattr(args, "progress_interval", 10),
     )
-    result = await orchestrator.run(args.request, base_ref=args.base_ref)
+    if getattr(args, "task_id", None):
+        result = await orchestrator.continue_task(args.task_id)
+    else:
+        result = await orchestrator.run(args.request, base_ref=args.base_ref)
     print(result.model_dump_json(indent=2))
     return 0 if result.status == "SUCCEEDED" else 1
 
@@ -98,7 +101,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run the bounded Planner → Coder → Tester → Reviewer pipeline"
     )
-    parser.add_argument("request", help="Task request")
+    parser.add_argument("request", help="Task request, or continue to resume a saved task")
     parser.add_argument("--repo", default=".")
     parser.add_argument(
         "--base-ref", default="HEAD", help="Committed snapshot; uncommitted changes are excluded"
@@ -128,7 +131,14 @@ def main() -> int:
         "--planner",
         help="Override Planner with module:function; factory receives isolated workspace Path",
     )
+    # Keep the existing request syntax; only the reserved "continue" command adds an ID.
+    parser.add_argument("task_id", nargs="?", help="Saved task ID for the continue command")
     args = parser.parse_args()
+    if args.request == "continue":
+        if not args.task_id:
+            parser.error("continue requires a task ID")
+    elif args.task_id:
+        parser.error("a task ID is only accepted after continue")
     try:
         with configure_logging(Path(args.output), verbose=args.verbose):
             return asyncio.run(run(args))

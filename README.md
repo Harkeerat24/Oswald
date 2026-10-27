@@ -118,6 +118,15 @@ Taskiq worker, or `make up` is required for this local flow.
 Use a checkout containing the orchestrator implementation and run the following
 commands from its root. The examples below use Bash/WSL/Linux.
 
+Resume a saved task without repeating completed stages:
+
+```bash
+uv run python -m oswald.cli continue <task-id>
+```
+
+Keep the original `--output` option if customized. The repository and image are saved. See
+[continuation behavior and limits](docs/orchestrator.md#continue-a-task).
+
 ### 1. Install and configure
 
 ```bash

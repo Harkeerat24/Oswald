@@ -16,7 +16,7 @@ from typing import Any
 
 import litellm
 import structlog
-from litellm.exceptions import APIError, RateLimitError
+from litellm.exceptions import APIError, RateLimitError, ServiceUnavailableError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from oswald.core.llm.exceptions import (
@@ -119,10 +119,16 @@ class LiteLLMAdapter:
         retry_config: RetryConfig | None = None,
         run_id: str = "",
         timeout_seconds: float = 300,
+        min_request_interval_seconds: float = 0,
     ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
+        if not math.isfinite(min_request_interval_seconds) or min_request_interval_seconds < 0:
+            raise ValueError("min_request_interval_seconds must be finite and nonnegative")
         self._timeout_seconds = timeout_seconds
+        self._min_request_interval_seconds = min_request_interval_seconds
+        self._request_lock = asyncio.Lock()
+        self._last_request_started: float | None = None
         self._api_key = api_key
         self._api_base = api_base
         self._retry_config = retry_config or RetryConfig()
@@ -131,10 +137,25 @@ class LiteLLMAdapter:
         # Suppress LiteLLM's verbose stdout logging in favor of structlog
         litellm.suppress_debug_info = True
 
+    async def _wait_for_request_slot(self) -> None:
+        if self._min_request_interval_seconds == 0:
+            return
+        async with self._request_lock:
+            if self._last_request_started is not None:
+                remaining = (
+                    self._last_request_started
+                    + self._min_request_interval_seconds
+                    - time.monotonic()
+                )
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            self._last_request_started = time.monotonic()
+
     async def complete(self, request: LLMRequest) -> LLMResponse:
         kwargs = self._build_litellm_kwargs(request)
 
         async def _call() -> LLMResponse:
+            await self._wait_for_request_slot()
             start = time.monotonic()
             try:
                 logger.debug(
@@ -178,7 +199,7 @@ class LiteLLMAdapter:
                     model=request.model,
                     retry_after_seconds=retry_after,
                 ) from exc
-            except APIError as exc:
+            except (APIError, ServiceUnavailableError) as exc:
                 raw_status = getattr(exc, "status_code", None)
                 status = raw_status if isinstance(raw_status, int) else None
                 is_retryable = status in (500, 502, 503, 529) if status is not None else False

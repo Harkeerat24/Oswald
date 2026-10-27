@@ -87,6 +87,20 @@ This command makes real model API calls. The automated tests do not require mode
 credentials. For your own project, replace `--repo` with its absolute path and
 `--image` with a prebuilt image containing its test dependencies.
 
+`--repo` must point to the Git repository root (containing `.git`), with at least
+one commit. An empty subfolder of another repository is not a standalone project.
+For a new project, initialize Git in that folder and commit its baseline first.
+React/Node projects need a Node image with their npm dependencies cached or installed;
+`python:3.12-slim` does not provide Node/npm, and sandbox networking is disabled.
+
+Model responses allow up to 16,384 output tokens by default so larger structured
+plans and file edits can complete. For low provider request quotas, set
+`LLM_MIN_REQUEST_INTERVAL_SECONDS=15` to space requests, including retries, within
+one CLI process. Concurrent runs still share provider quotas. Pacing cannot restore
+an exhausted daily quota; enable billing, wait for reset, or select an available
+model using the agent model environment variables. Model listings can include
+models that reject generation for a particular account.
+
 The runtime binds the isolated worktree at `/workspace`; Planner's read tools,
 Coder's edit tools, and Tester's Docker commands all use the same repository
 snapshot. Uncommitted changes in the source checkout are excluded. `--base-ref`

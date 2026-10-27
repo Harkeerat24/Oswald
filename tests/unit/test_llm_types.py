@@ -161,7 +161,7 @@ def test_llm_request_validation_rules() -> None:
         messages=[valid_msg],
     )
     assert req.model == "claude-3-5-sonnet-20241022"
-    assert req.max_tokens == 4096
+    assert req.max_tokens == 16384
     assert req.temperature == 0.0
     assert req.tools == []
     assert req.stop_sequences == []

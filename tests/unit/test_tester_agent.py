@@ -721,18 +721,34 @@ async def test_tester_allows_editing_test_files_present_in_spec_and_changes(
     assert "def test_updated(): pass" in test_file.read_text(encoding="utf-8")
 
 
-async def test_diagnostics_and_missing_runner_do_not_poison_unittest(workspace: Path) -> None:
+@pytest.mark.parametrize("diagnostic_times_out", [False, True])
+async def test_diagnostics_and_missing_runner_do_not_poison_unittest(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, diagnostic_times_out: bool
+) -> None:
     import json
 
     llm = FakeLLMClient()
     sandbox = FakeSandboxRuntime(SandboxConfig(task_id="tester-1", workspace_path=workspace))
-    sandbox.queue_response(stdout="Python 3.12")
+    if not diagnostic_times_out:
+        sandbox.queue_response(stdout="Python 3.12")
+    original_exec = sandbox.exec_command
+
+    async def exec_with_timeout(
+        cmd: list[str], timeout_seconds: float = 120.0, env: dict[str, str] | None = None
+    ) -> ExecResult:
+        if diagnostic_times_out and cmd == ["python", "--version"]:
+            raise SandboxTimeoutError("Diagnostic timed out")
+        return await original_exec(cmd, timeout_seconds=timeout_seconds, env=env)
+
+    monkeypatch.setattr(sandbox, "exec_command", exec_with_timeout)
+    sandbox.queue_response(stdout="Production build completed")
     sandbox.queue_response(exit_code=127, stdout="exec: pytest: executable file not found in $PATH")
     sandbox.queue_response(stdout="Ran 1 test in 0.001s\n\nOK")
     await sandbox.start()
     calls: list[tuple[str, dict[str, Any]]] = [
         ("run_test_command", {"command": ["git", "status", "--porcelain"]}),
         ("run_diagnostic_command", {"command": ["python", "--version"]}),
+        ("run_test_command", {"command": ["npm", "run", "build"]}),
         ("run_test_command", {"command": ["pytest", "test_app.py"]}),
         (
             "write_test_file",
@@ -833,3 +849,37 @@ async def test_unittest_discovery_recovery_and_inline_diagnostics(workspace: Pat
     assert result.passed and result.tests_run == 1 and result.tests_failed == 0
     assert not result.execution_error
     assert "No tests ran" in result.output
+
+
+@pytest.mark.parametrize("action", ["install", "i", "update"])
+async def test_tester_blocks_npm_manifest_mutations(workspace: Path, action: str) -> None:
+    sandbox = FakeSandboxRuntime(SandboxConfig(task_id="tester-1", workspace_path=workspace))
+    await sandbox.start()
+    agent = TesterAgent(FakeLLMClient(), sandbox, workspace)
+    output, success, result = await agent._execute_tool(
+        ToolCall(
+            id="install",
+            name="run_diagnostic_command",
+            arguments={"command": ["npm", action, "--offline"]},
+        ),
+        set(),
+    )
+    assert not success and result is None
+    assert "npm ci --offline" in output
+    assert sandbox.executed_commands == []
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"),
+    [("6 passed", (6, 0)), ("1 failed | 5 passed", (6, 1))],
+)
+def test_colored_vitest_metrics_use_tests_not_file_counts(
+    summary: str, expected: tuple[int, int]
+) -> None:
+    from oswald.core.tools.tester.runtime import CommandResult
+
+    output = (
+        "\x1b[2m Test Files \x1b[22m \x1b[32m3 passed\x1b[39m (3)\n"
+        f"\x1b[2m      Tests \x1b[22m \x1b[32m{summary}\x1b[39m (6)\n"
+    )
+    assert TesterAgent._extract_metrics([CommandResult(["npm", "test"], 0, output, 1)]) == expected

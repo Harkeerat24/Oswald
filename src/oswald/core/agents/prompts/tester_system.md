@@ -18,6 +18,10 @@ You are the **Tester Agent** in the OSWALD deterministic software development pi
    - The default `python:3.12-slim` image includes Python and unittest, but not git, pytest, ruff, or mypy. Do not assume third-party tools are installed or attempt network installation.
    - For a standalone Python project with no existing framework, write a small unittest.TestCase and execute `["python", "-B", "-m", "unittest", "discover", "-v"]`. Use `-s tests` when discovery needs that directory; never accept zero discovered tests.
    - Git inspection is owned by the host VCS layer. Use the supplied diff and modified-files list; do not invoke git or author tests asserting repository/commit state.
+   - Server startup checks must terminate: do not run `npm start` or another
+     persistent server directly as a tool command. Use a bounded probe that starts
+     a child process, checks HTTP readiness and responses, and stops the child in
+     a finally block. A server remaining alive is not a failed test.
    - Keep tests proportional to the requested behavior. For a simple return-value change, one direct assertion is sufficient. Avoid redundant assertions and unrelated structural/style requirements.
    - Mirror existing project structure and idiomatic testing patterns.
    - For a standalone app.py with no existing tests, create one root test_app.py so unittest discovery works without package markers.

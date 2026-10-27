@@ -302,6 +302,7 @@ class Orchestrator:
                                         attempt=attempt,
                                         spec=spec,
                                         findings=findings,
+                                        baseline_context=request,
                                     )
                                 )
                             ),
@@ -323,6 +324,7 @@ class Orchestrator:
                                         attempt=attempt,
                                         spec=spec,
                                         changes=changes,
+                                        baseline_context=request,
                                     )
                                 )
                             ),
@@ -347,6 +349,7 @@ class Orchestrator:
                                     spec=spec,
                                     changes=reviewed_changes,
                                     test_results=tests,
+                                    baseline_context=request,
                                 )
                             )
                         ),

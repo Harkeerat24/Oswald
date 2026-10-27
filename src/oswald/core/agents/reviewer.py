@@ -36,6 +36,7 @@ class ReviewerInput(BaseModel):
     spec: PlanSpec
     changes: CodeChanges
     test_results: TestResults
+    baseline_context: str = ""
 
 
 class _ReviewResponse(BaseModel):
@@ -114,6 +115,11 @@ class ReviewerAgent:
                             "spec": spec.model_dump(mode="json"),
                             "changes": changes.model_dump(mode="json"),
                             "test_results": test_results.model_dump(mode="json"),
+                            **(
+                                {"original_request": data.baseline_context}
+                                if data.baseline_context.strip()
+                                else {}
+                            ),
                         },
                         ensure_ascii=False,
                     ),

@@ -117,7 +117,7 @@ class LLMRequest(_ImmutableBase):
         description="List of tools available for model invocation",
     )
     max_tokens: int = Field(
-        default=4096,
+        default=16384,
         gt=0,
         description="Upper bound on output tokens to generate",
     )

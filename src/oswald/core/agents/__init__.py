@@ -15,6 +15,7 @@ from oswald.core.agents.coder import (
     EventSink,
     InMemoryEventSink,
     NoOpBudgetGuard,
+    NoOpEventSink,
     RunEvent,
 )
 from oswald.core.agents.planner import PlannerAgent, PlannerInput
@@ -29,6 +30,7 @@ __all__ = [
     "EventSink",
     "InMemoryEventSink",
     "NoOpBudgetGuard",
+    "NoOpEventSink",
     "PlannerAgent",
     "PlannerInput",
     "ReviewerAgent",

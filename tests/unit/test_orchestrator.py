@@ -167,6 +167,16 @@ async def test_success_persists_cumulative_patch_and_lineage(repo: Path, tmp_pat
         assert await h.store.exists(result.task_id, ref.name)
     manifest = json.loads((h.output / result.task_id / "run.json").read_text())
     assert manifest["status"] == "SUCCEEDED" and manifest["base_commit"]
+    assert len(result.metrics.agents) == 4
+    assert [entry.agent for entry in result.metrics.agents] == [
+        "planner",
+        "coder",
+        "tester",
+        "reviewer",
+    ]
+    assert all(entry.outcome == "completed" for entry in result.metrics.agents)
+    assert result.metrics.elapsed_seconds > 0
+    assert manifest["metrics"] == result.metrics.model_dump()
 
 
 @pytest.mark.parametrize("source", ["tester", "reviewer"])
@@ -183,6 +193,15 @@ async def test_one_correction_gets_findings_and_reruns_both(
     assert isinstance(coder_input, CoderInput)
     assert coder_input.attempt == 2
     assert source in {finding.source for finding in coder_input.findings}
+    assert [(entry.agent, entry.attempt) for entry in result.metrics.agents] == [
+        ("planner", 1),
+        ("coder", 1),
+        ("tester", 1),
+        ("reviewer", 1),
+        ("coder", 2),
+        ("tester", 2),
+        ("reviewer", 2),
+    ]
     # The content-addressed store deduplicates identical test reports.
     assert len(await h.store.history(result.task_id, "test_results")) == (
         2 if source == "tester" else 1
@@ -232,6 +251,8 @@ async def test_stage_exception(repo: Path, tmp_path: Path, stage: str) -> None:
     result = await h.pipeline.run("Fix")
     assert result.status == "FAILED" and result.stage == stage
     assert "unavailable" in result.reason
+    assert result.metrics.agents[-1].agent == stage
+    assert result.metrics.agents[-1].outcome == "failed"
     assert h.runtime and h.runtime.status == SandboxStatus.STOPPED
     assert not Path(result.workspace_root).exists()
 

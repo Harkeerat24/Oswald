@@ -97,6 +97,76 @@ or failed. Ctrl-C records cancellation and exits `130` after cleanup. JSON outpu
 includes the task ID, stage, reason, attempts, base commit, artifact references, and
 patch path. Logs go to stderr.
 
+## Reading agent progress logs
+
+Progress uses the existing scrolling logs on stderr. Stdout remains a single JSON
+result, so redirecting it to a file still works. Every agent attempt reports its
+identity, elapsed time, confirmed input/output tokens, attempted tool calls, model
+calls, and tool errors. For example (illustrative values):
+
+```text
+12:00:08Z INFO    CODER    started        elapsed=0.0s tokens=0/0 tool_calls=0 llm_calls=0 attempt=1 task_id=a81c1234
+12:00:12Z INFO    CODER    llm_completed  elapsed=4.0s tokens=2300/310 tool_calls=0 llm_calls=1 attempt=1 task_id=a81c1234 turn=1 model="provider/model"
+12:00:12Z INFO    CODER    tool_started   elapsed=4.0s tokens=2300/310 tool_calls=1 llm_calls=1 attempt=1 task_id=a81c1234 tool="read_file_range"
+12:00:22Z INFO    CODER    running        elapsed=14.0s tokens=2300/310 tool_calls=1 llm_calls=2 attempt=1 task_id=a81c1234 action="waiting_for_model"
+12:00:39Z INFO    CODER    completed      elapsed=31.0s tokens=4800/810 tool_calls=3 llm_calls=3 attempt=1 task_id=a81c1234 files_changed=2
+```
+
+`tokens=input/output` is cumulative within the current agent attempt, rather than
+just the latest model request. Counts update after a response returns; a pending
+request shows the last confirmed count. If any request fails, is cancelled, or
+omits usage, the attempt's token totals become `unknown` (`null` in JSON), rather
+than claiming complete accounting. Provider-reported zero usage remains zero.
+These are response usage counts, not billing estimates; unavailable usage from
+provider-internal retries cannot be reconstructed.
+
+`tool_calls` counts actual dispatch attempts, including rejected/failed tools.
+Model-proposed calls that are never dispatched are not counted. `tool_errors`
+counts dispatches the agent reports as unsuccessful, including aborted calls;
+a test command that finds failing tests may therefore also be an unsuccessful
+tool invocation. Reviewer normally has zero tool calls. A saved plan has no model
+usage. A custom Planner's internal calls are metered only if it uses the shared
+`complete` and `tool_call` helpers from `oswald.core.agents.telemetry`.
+
+A quiet agent emits `running` approximately every 10 seconds with its current
+action, such as `waiting_for_model` or `tool:run_test_command`. Other progress
+messages suppress redundant heartbeat messages. This is an async timer, so a
+synchronous tool that blocks the event loop can delay a heartbeat. Agent elapsed
+time includes its tools and model waits; run elapsed time also includes workspace
+setup and cleanup. Timers use a monotonic clock. Log timestamps use UTC (`Z`).
+
+Use `--progress-interval 2` for a shorter quiet-period interval, or `--verbose`
+for provider request/retry details and successful tool completion events. The
+interval must be finite and positive. Counters reset for each correction attempt;
+run totals accumulate across all attempts. Existing warnings and provider retry
+logs include the active task, agent, attempt, and current counters.
+
+The final `run.completed` line reports status, run totals, the latest available
+test counts and review verdict, and the patch/report paths. Failed/stopped runs
+also include a short reason. Zero counted tests are explicitly labelled
+`No tests reported` in the Tester log; the logger does not invent collection
+results or alter test routing. Terminal fields are shortened for readability;
+the structured log preserves full task IDs and UTC timestamps.
+
+The CLI also streams JSONL progress events to `<output>/progress.jsonl`, shared
+across runs in that output directory. Rotation keeps the current file and two
+backups (`progress.jsonl.1` and `.2`), targeting 1 MiB per file. Rotation bounds
+history, not a single exceptionally large record; full task artifacts and sandbox
+command logs have their own existing retention behavior. Use separate output
+directories for concurrently running CLI processes, since file rotation is
+process-local. Per-run final metrics, including one small summary for each agent
+attempt, remain in `<output>/<task-id>/run.json` under `metrics` and in stdout JSON.
+
+The default event sink discards raw lifecycle/tool event objects after use. Only
+small counters, the current action, and the bounded pipeline's attempt summaries
+are retained for progress. Tests or integrations that need raw events can still
+explicitly inject `InMemoryEventSink`. Progress requires no extra model calls.
+Programmatic callers retain their logging configuration; to use the CLI formatting
+and bounded JSONL output, wrap execution in
+`with oswald.observability.logging.configure_logging(output_dir): ...`.
+
+## Saved outputs
+
 Inspect `.oswald/runs/<task-id>/`:
 
 - `request.json`: original request, workspace, and pinned base commit.
@@ -107,7 +177,7 @@ Inspect `.oswald/runs/<task-id>/`:
   content-addressed artifact storage with lineage. Identical payloads are deduplicated.
 - `logs/`: copied Docker command stdout/stderr logs.
 - `final.patch`: cumulative implementation and test changes, also saved on failures.
-- `run.json`: terminal outcome and any cleanup errors.
+- `run.json`: terminal outcome, cleanup errors, and aggregate/per-attempt `metrics`.
 
 Review the patch before applying it to the original repository:
 

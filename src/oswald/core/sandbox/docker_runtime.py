@@ -160,7 +160,7 @@ class DockerSandboxRuntime:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._workspace_path = Path(config.workspace_path).resolve()
         self._status: SandboxStatus = SandboxStatus.PENDING
-        self._log = structlog.get_logger().bind(
+        self._log = structlog.get_logger(
             component="sandbox.docker",
             task_id=config.task_id,
         )

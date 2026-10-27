@@ -137,7 +137,7 @@ class LiteLLMAdapter:
         async def _call() -> LLMResponse:
             start = time.monotonic()
             try:
-                logger.info(
+                logger.debug(
                     "llm.completion.started",
                     run_id=self._run_id,
                     model=request.model,
@@ -148,7 +148,7 @@ class LiteLLMAdapter:
                 elapsed = time.monotonic() - start
                 response = self._translate_response(raw, request.model, elapsed)
 
-                logger.info(
+                logger.debug(
                     "llm.completion.success",
                     run_id=self._run_id,
                     model=request.model,
@@ -297,5 +297,9 @@ class LiteLLMAdapter:
             provider_metadata={
                 "elapsed_seconds": round(elapsed, 3),
                 "raw_finish_reason": finish,
+                "usage_available": (
+                    getattr(usage_data, "prompt_tokens", None) is not None
+                    and getattr(usage_data, "completion_tokens", None) is not None
+                ),
             },
         )

@@ -22,7 +22,7 @@ from oswald.core.tools.coder.read import (
     validate_workspace_path,
 )
 
-logger = structlog.get_logger().bind(component="tools.tester")
+logger = structlog.get_logger(component="tools.tester")
 
 _EXCLUDED_DIRS = {
     ".git",

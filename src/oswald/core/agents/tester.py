@@ -200,6 +200,18 @@ class TesterAgent:
             elif name in {"run_test_command", "run_diagnostic_command"}:
                 raw_command = args.get("command")
                 command = [str(c) for c in raw_command] if isinstance(raw_command, list) else []
+                if (
+                    len(command) > 1
+                    and Path(command[0]).name in {"npm", "npm.cmd"}
+                    and command[1] in {"install", "i", "add", "update", "uninstall", "remove"}
+                ):
+                    return (
+                        "Tester cannot run npm commands that modify package manifests or lockfiles. "
+                        "For an authorized cached install, use npm ci --offline --ignore-scripts "
+                        "--no-audit --no-fund via run_diagnostic_command.",
+                        False,
+                        None,
+                    )
                 if command and Path(command[0]).name == "git":
                     return (
                         "Git inspection belongs to the host VCS layer. Use the supplied unified diff "
@@ -215,10 +227,17 @@ class TesterAgent:
                     and Path(command[0]).name.startswith(("python", "pypy"))
                     and "-c" in command
                 )
-                if (
-                    name == "run_diagnostic_command" or python_inline
-                ) and not command_result.execution_error:
-                    return command_result.output, command_result.exit_code == 0, None
+                npm_diagnostic = bool(
+                    len(command) > 1
+                    and Path(command[0]).name in {"npm", "npm.cmd"}
+                    and (command[1] in {"ci", "start"} or command[1:3] == ["run", "build"])
+                )
+                if name == "run_diagnostic_command" or python_inline or npm_diagnostic:
+                    return (
+                        f"Exit {command_result.exit_code}\n{command_result.output}",
+                        command_result.exit_code == 0 and not command_result.execution_error,
+                        None,
+                    )
                 if (
                     command_result.exit_code == 127
                     or "No module named pytest" in command_result.output
@@ -304,7 +323,11 @@ class TesterAgent:
         tests_failed = 0
 
         for result in commands:
-            text = result.output
+            text = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+            # Vitest prints file counts before test counts. Prefer the test summary.
+            test_summary = re.search(r"^\s*Tests:?\s+([^\n]+)", text, re.MULTILINE)
+            if test_summary:
+                text = test_summary.group(1)
 
             # Standard-library unittest: counts are on a separate line from failures.
             unittest_match = re.search(r"\bRan\s+(\d+)\s+tests?\b", text)
